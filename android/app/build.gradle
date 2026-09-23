@@ -1,0 +1,93 @@
+plugins {
+    id "com.android.application"
+    id "kotlin-android"
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file('local.properties')
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.withReader('UTF-8') { reader ->
+        localProperties.load(reader)
+    }
+}
+
+def flutterVersionCode = localProperties.getProperty('flutter.versionCode')
+if (flutterVersionCode == null) {
+    flutterVersionCode = '1'
+}
+
+def flutterVersionName = localProperties.getProperty('flutter.versionName')
+if (flutterVersionName == null) {
+    flutterVersionName = '1.0'
+}
+
+android {
+    namespace "com.farou9.codeit"
+    compileSdk 34
+
+    ndkVersion "26.3.11579264"
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+    }
+
+    defaultConfig {
+        applicationId "com.farou9.codeit"
+        minSdk 24          // Android 7.0 — lowest with reliable PRoot
+        targetSdk 34
+        versionCode flutterVersionCode.toInteger()
+        versionName flutterVersionName
+        ndk {
+            // Only 64-bit is supported: W^X enforcement; 32-bit deprecated on modern devices
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.debug
+            minifyEnabled false
+            shrinkResources false
+        }
+        debug {
+            // Keep native libs uncompressed so OS can extract to nativeLibraryDir
+            packagingOptions {
+                jniLibs {
+                    useLegacyPackaging = false
+                }
+            }
+        }
+    }
+
+    // Ensure .so in jniLibs are kept uncompressed in APK (required for nativeLibraryDir exec)
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+
+    // Required: native libs must remain uncompressed
+    // AGP 8+ does this by default for .so, but we are explicit.
+    // extractNativeLibs=true in manifest ensures extraction to nativeLibraryDir.
+}
+
+flutter {
+    source '../..'
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.22"
+    implementation "androidx.core:core-ktx:1.12.0"
+    // Foreground service
+    implementation "androidx.lifecycle:lifecycle-service:2.7.0"
+}
