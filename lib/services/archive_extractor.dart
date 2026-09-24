@@ -77,7 +77,17 @@ class ArchiveExtractor {
     int ok = 0, skipped = 0, failed = 0;
 
     for (final entry in archive.files) {
-      final entryPath = p.join(destDir, p.normalize(entry.name));
+      // Rootfs tarballs may store absolute paths ("/bin/sh") or relative
+      // ("bin/sh"). Always strip the leading "/" so paths stay under destDir
+      // (package:path.join would otherwise treat "/bin/sh" as absolute and
+      // escape / skip the entry via the zip-slip guard).
+      var rawName = entry.name.replaceAll('\\', '/');
+      while (rawName.startsWith('/')) {
+        rawName = rawName.substring(1);
+      }
+      if (rawName.isEmpty || rawName == '.') continue;
+
+      final entryPath = p.join(destDir, p.normalize(rawName));
 
       // Zip-slip guard
       if (!p.isWithin(destCanonical, p.canonicalize(entryPath))) {
@@ -89,26 +99,29 @@ class ArchiveExtractor {
       try {
         // --- Symlink (check BEFORE isFile — symlinks may report isFile=true) ---
         if (entry.isSymbolicLink) {
-          final target = entry.nameOfLinkedFile;
+          var target = entry.nameOfLinkedFile;
           if (target.isEmpty) {
             debugPrint('[ArchiveExtractor] SKIPPED (empty symlink target): ${entry.name}');
             skipped++;
             continue;
           }
-          // Validate relative target stays inside destDir
-          final linkParent = p.dirname(entryPath);
-          final resolvedTarget = p.normalize(p.join(linkParent, target));
-          if (p.isAbsolute(target) ||
-              !p.isWithin(destCanonical, p.canonicalize(resolvedTarget))) {
-            debugPrint(
-                '[ArchiveExtractor] SKIPPED (symlink escapes dest): '
-                '${entry.name} -> $target');
-            skipped++;
-            continue;
+          // Absolute symlink targets (e.g. "/bin/busybox") are normal inside a
+          // rootfs — they are guest paths resolved by proot, NOT host paths.
+          // Preserve them as-is. Relative targets must stay under destDir.
+          if (!p.isAbsolute(target)) {
+            final linkParent = p.dirname(entryPath);
+            final resolvedTarget = p.normalize(p.join(linkParent, target));
+            if (!p.isWithin(destCanonical, p.canonicalize(resolvedTarget))) {
+              debugPrint(
+                  '[ArchiveExtractor] SKIPPED (symlink escapes dest): '
+                  '${entry.name} -> $target');
+              skipped++;
+              continue;
+            }
           }
 
           // Ensure parent directory exists
-          await Directory(linkParent).create(recursive: true);
+          await Directory(p.dirname(entryPath)).create(recursive: true);
 
           // Remove any existing file/link/dir at this path to avoid
           // "File exists" / "Permission Denied"

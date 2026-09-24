@@ -135,9 +135,41 @@ class RootfsInstaller {
 
       if (_cancelled) throw const _CancelledException();
 
+      // ---------- Verify shell exists before marking installed ----------
+      // Absolute-path tar entries and broken symlink extraction used to leave
+      // rootfs without /bin/sh, causing:
+      //   proot error: '/bin/sh' not found (root=.../rootfs, cwd=/root, $PATH=(null))
+      final shellOk = await _verifyShell(rootfsDir.path);
+      if (!shellOk) {
+        _emit(InstallPhase.extracting,
+            'Extraction incomplete — /bin/sh missing. Retrying with Dart extractor…');
+        // Force Dart path (native tar may have failed silently on abs paths)
+        try {
+          await rootfsDir.delete(recursive: true);
+        } catch (_) {}
+        await rootfsDir.create(recursive: true);
+        final retryOk = await ArchiveExtractor.extract(
+          archivePath: archivePath,
+          destDir: rootfsDir.path,
+        );
+        if (!retryOk || !await _verifyShell(rootfsDir.path)) {
+          final detail = await _describeRootfs(rootfsDir.path);
+          throw Exception(
+              'Rootfs extraction incomplete: /bin/sh not found under '
+              '$rootfsDir. $detail Re-run setup to re-download.');
+        }
+        _emit(InstallPhase.extracting, 'Retry succeeded — /bin/sh present.');
+      }
+
       // ---------- Post-configure ----------
       _emit(InstallPhase.configuring, 'Initializing permissions…', progress: null);
       await _postConfigure(rootfsDir.path);
+
+      // Final gate — never mark installed without a shell
+      if (!await _verifyShell(rootfsDir.path)) {
+        throw Exception(
+            'Post-configure failed: /bin/sh still missing in $rootfsDir');
+      }
 
       // ---------- Cleanup ----------
       try {
@@ -148,7 +180,14 @@ class RootfsInstaller {
       // ---------- Mark installed ----------
       await PRootEngine.instance.setInstalled(true, distroId: distro.id);
 
-      _emit(InstallPhase.done, 'Setup complete — launching terminal…',
+      final shPath = File('${rootfsDir.path}/bin/sh');
+      final bashPath = File('${rootfsDir.path}/bin/bash');
+      debugPrint('[RootfsInstaller] shell check: '
+          'bin/sh exists=${shPath.existsSync()} '
+          'bin/bash exists=${bashPath.existsSync()}');
+
+      _emit(InstallPhase.done,
+          'Setup complete — /bin/sh verified. Launching terminal…',
           progress: 1.0);
       return true;
     } on _CancelledException {
@@ -281,6 +320,53 @@ class RootfsInstaller {
     } catch (e, st) {
       debugPrint('[RootfsInstaller] native tar exception: $e\n$st');
       return false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Shell / rootfs verification
+  // ---------------------------------------------------------------------------
+
+  /// Returns true if `<rootfs>/bin/sh` or `<rootfs>/bin/bash` exists
+  /// (follows symlinks — a dangling symlink does NOT count).
+  Future<bool> _verifyShell(String rootfs) async {
+    for (final rel in ['bin/sh', 'bin/bash', 'usr/bin/bash', 'bin/dash']) {
+      final f = File('$rootfs/$rel');
+      try {
+        // File.exists() follows symlinks on dart:io — false for broken links.
+        if (await f.exists()) {
+          debugPrint('[RootfsInstaller] shell OK: $rel → ${f.absolute.path}');
+          return true;
+        }
+        // Distinguish broken symlink from missing for logs
+        try {
+          final link = Link('$rootfs/$rel');
+          if (await link.exists()) {
+            final target = await link.target();
+            debugPrint(
+                '[RootfsInstaller] BROKEN symlink $rel → $target (target missing)');
+          }
+        } catch (_) {}
+      } catch (e) {
+        debugPrint('[RootfsInstaller] shell check error for $rel: $e');
+      }
+    }
+    return false;
+  }
+
+  /// Best-effort listing for error messages.
+  Future<String> _describeRootfs(String rootfs) async {
+    try {
+      final bin = Directory('$rootfs/bin');
+      if (!await bin.exists()) return 'No $rootfs/bin directory.';
+      final names = await bin
+          .list()
+          .map((e) => e.uri.pathSegments.last)
+          .take(20)
+          .toList();
+      return 'bin/ contains: ${names.join(", ")}';
+    } catch (e) {
+      return 'Cannot list bin/: $e';
     }
   }
 

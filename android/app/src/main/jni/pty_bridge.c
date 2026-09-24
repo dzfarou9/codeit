@@ -12,19 +12,17 @@
  *     -w /root \
  *     <shell>                 # /bin/bash or /bin/sh — DIRECT exec, no env wrapper
  *
- * Environment (PATH/HOME/TERM/LANG/PROOT_TMP_DIR) is set on the child via
- * setenv() BEFORE execl, so proot and the guest shell inherit it. We do NOT
- * use /usr/bin/env — minimal rootfs images often lack it, which caused:
- *   proot error: '/usr/bin/env' not found ... $PATH=(null)
+ * Environment is passed as an EXPLICIT envp[] to execve() — built in Kotlin
+ * as Array<String> of "KEY=VALUE" and converted here. We never pass a null
+ * env array (that produced `$PATH=(null)` in proot diagnostics).
+ * Required keys: PROOT_TMP_DIR, PATH, HOME, TERM, LANG, SHELL.
  *
  * PROOT_TMP_DIR points at <filesDir>/tmp (created in Kotlin) so proot can
  * create temporary files (else: "can't create temporary file").
  *
- * Shell detection order inside rootfs (host-visible paths):
- *   1. /bin/bash   (Ubuntu, Debian)
- *   2. /bin/sh     (Alpine, minimal images)
- *   /bin/busybox is intentionally NOT probed — broken symlinks caused
- *   execve("/bin/busybox"): No such file or directory.
+ * Shell detection: /bin/bash if present, else /bin/sh. FAILS hard if neither
+ * exists under rootfs (dangling default caused:
+ *   proot error: '/bin/sh' not found ... $PATH=(null)).
  *
  * Every failure path logs errno + context via __android_log_print so
  * logcat tag "PtyBridge-JNI" shows the exact failing call.
@@ -45,6 +43,7 @@
 #include <pty.h>
 #include <sys/types.h>
 #include <stdarg.h>
+#include <limits.h>
 
 #define LOG_TAG "PtyBridge-JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -56,6 +55,10 @@
 static int g_masterFd = -1;
 static int g_childPid  = -1;
 static char g_lastError[512] = {0};
+
+/* Forward decls for env helpers used by nativePtyStart */
+static void free_envp(char **envp);
+static char **build_envp(JNIEnv *env, jobjectArray jEnvp);
 
 static void set_winsize(int fd, int cols, int rows) {
     struct winsize ws;
@@ -88,14 +91,16 @@ static int file_exists(const char *path) {
 /**
  * Detect the best shell inside [rootfsDir].
  * Writes the guest path (e.g. "/bin/bash") into [out].
- * Always returns 0 (default "/bin/sh").
+ * Returns 0 on success; -1 if NO shell exists (caller must abort —
+ * defaulting to a missing /bin/sh produced:
+ *   proot error: '/bin/sh' not found ...).
  *
  * Candidates: /bin/bash, /bin/sh only. We never probe /bin/busybox —
  * Alpine images often have a broken/missing busybox path which caused:
  *   proot error: execve("/bin/busybox"): No such file or directory
  *
  * NOTE: We intentionally do NOT check /usr/bin/env — proot execs the
- * shell path directly; env is provided via setenv() on the child.
+ * shell path directly; env is provided via explicit envp[] on execve.
  */
 static int detect_shell(const char *rootfsDir, char *out, size_t outLen) {
     const char *candidates[] = { "/bin/bash", "/bin/sh", NULL };
@@ -108,20 +113,78 @@ static int detect_shell(const char *rootfsDir, char *out, size_t outLen) {
             LOGI("detect_shell: found %s (host=%s)", candidates[i], hostPath);
             return 0;
         }
-        /* Also accept a plain file (not +x yet — proot/chmod may fix later) */
         if (file_exists(hostPath)) {
             snprintf(out, outLen, "%s", candidates[i]);
             LOGW("detect_shell: %s exists but not +x (host=%s) — using anyway",
                  candidates[i], hostPath);
             return 0;
         }
+        /* Log dangling symlink for diagnosis */
+        if (access(hostPath, F_OK) != 0 && errno == ENOENT) {
+            /* Try readlink to see if a broken symlink is present */
+            char linkBuf[256];
+            ssize_t n = readlink(hostPath, linkBuf, sizeof(linkBuf) - 1);
+            if (n > 0) {
+                linkBuf[n] = '\0';
+                LOGW("detect_shell: BROKEN symlink %s → %s", hostPath, linkBuf);
+            }
+        }
     }
 
-    /* Default: /bin/sh (present in virtually every rootfs) */
-    snprintf(out, outLen, "/bin/sh");
-    LOGW("detect_shell: no /bin/bash or /bin/sh under %s — defaulting to /bin/sh",
-         rootfsDir);
-    return 0;
+    set_error("No shell in rootfs: neither /bin/bash nor /bin/sh exists under %s "
+              "(extraction incomplete — re-run Setup)", rootfsDir);
+    return -1;
+}
+
+/* Build a NULL-terminated char* envp[] from a Java String[] of "KEY=VALUE".
+ * Returns heap array; caller frees with free_envp(). Returns NULL on failure. */
+static char **build_envp(JNIEnv *env, jobjectArray jEnvp) {
+    if (jEnvp == NULL) {
+        LOGE("build_envp: jEnvp is NULL — refusing (would cause $PATH=(null))");
+        return NULL;
+    }
+    jsize n = (*env)->GetArrayLength(env, jEnvp);
+    if (n <= 0) {
+        LOGE("build_envp: envp length=%d — refusing empty env", (int)n);
+        return NULL;
+    }
+    char **envp = (char **) calloc((size_t)n + 1, sizeof(char *));
+    if (envp == NULL) return NULL;
+
+    int count = 0;
+    int hasPath = 0, hasTmp = 0;
+    for (jsize i = 0; i < n; i++) {
+        jstring jstr = (jstring) (*env)->GetObjectArrayElement(env, jEnvp, i);
+        if (jstr == NULL) {
+            envp[count] = NULL;
+            break;
+        }
+        const char *utf = (*env)->GetStringUTFChars(env, jstr, NULL);
+        if (utf != NULL) {
+            envp[count] = strdup(utf);
+            if (strncmp(utf, "PATH=", 5) == 0) hasPath = 1;
+            if (strncmp(utf, "PROOT_TMP_DIR=", 14) == 0) hasTmp = 1;
+            (*env)->ReleaseStringUTFChars(env, jstr, utf);
+            count++;
+        }
+        (*env)->DeleteLocalRef(env, jstr);
+    }
+    envp[count] = NULL;
+
+    if (!hasPath || !hasTmp) {
+        LOGE("build_envp: incomplete env (PATH=%d PROOT_TMP_DIR=%d) — aborting",
+             hasPath, hasTmp);
+        free_envp(envp);
+        return NULL;
+    }
+    LOGI("build_envp: %d entries, PATH and PROOT_TMP_DIR present", count);
+    return envp;
+}
+
+static void free_envp(char **envp) {
+    if (envp == NULL) return;
+    for (int i = 0; envp[i] != NULL; i++) free(envp[i]);
+    free(envp);
 }
 
 /* --------------------------------------------------------------------------
@@ -133,6 +196,7 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
         JNIEnv *env, jobject thiz,
         jstring jProotPath, jstring jBashPath, jstring jRootfsPath,
         jstring jFilesDir, jstring jNativeLibDir, jstring jTmpDir,
+        jobjectArray jEnvp,
         jint cols, jint rows) {
 
     const char *prootPath    = (*env)->GetStringUTFChars(env, jProotPath, NULL);
@@ -152,6 +216,14 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
     LOGI("  nativeLibDir = %s", nativeLibDir);
     LOGI("  tmpDir       = %s", tmpDir);
     LOGI("  cols=%d rows=%d", cols, rows);
+
+    /* ---- Build explicit envp[] BEFORE fork (JNI not safe in child) ---- */
+    char **envp = build_envp(env, jEnvp);
+    if (envp == NULL) {
+        set_error("Failed to build envp from Kotlin Array<String> — "
+                  "env must be non-null with PATH and PROOT_TMP_DIR");
+        goto fail;
+    }
 
     /* ---- Pre-flight binary verification ---- */
     if (!file_exists(prootPath)) {
@@ -174,6 +246,24 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
     }
     LOGI("rootfs OK: %s", rootfsPath);
 
+    /* ---- Verify shell exists under rootfs BEFORE fork/proot ---- */
+    {
+        char shHost[1024];
+        snprintf(shHost, sizeof(shHost), "%s/bin/sh", rootfsPath);
+        char bashHost[1024];
+        snprintf(bashHost, sizeof(bashHost), "%s/bin/bash", rootfsPath);
+        int shExists = file_exists(shHost);
+        int bashExists = file_exists(bashHost);
+        LOGI("shell preflight: %s exists=%d  %s exists=%d",
+             shHost, shExists, bashHost, bashExists);
+        if (!shExists && !bashExists) {
+            set_error("Rootfs extraction incomplete: /bin/sh not found at %s "
+                      "(and no /bin/bash) — re-run SetupScreen to re-extract",
+                      shHost);
+            goto fail;
+        }
+    }
+
     /* ---- PROOT_TMP_DIR — writable host dir for proot temp files ---- */
     if (tmpDir == NULL || tmpDir[0] == '\0') {
         set_error("PROOT_TMP_DIR empty — pass filesDir/tmp from Kotlin");
@@ -189,7 +279,7 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
     }
     LOGI("PROOT_TMP_DIR OK: %s", tmpDir);
 
-    /* ---- Detect shell inside rootfs ---- */
+    /* ---- Detect shell inside rootfs (fails hard if missing) ---- */
     char shellInGuest[256];
     if (detect_shell(rootfsPath, shellInGuest, sizeof(shellInGuest)) != 0) {
         goto fail;  /* set_error already called */
@@ -248,74 +338,70 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
         if (slaveFd > 2) close(slaveFd);
 
         /* ------------------------------------------------------------------
-         * Environment for the child process (proot + guest shell inherit).
-         * setenv before execl — NO /usr/bin/env wrapper (minimal rootfs
-         * images often lack /usr/bin/env, which caused:
-         *   proot error: '/usr/bin/env' not found ... $PATH=(null))
-         *
-         * PROOT_TMP_DIR is required — without it proot fails:
-         *   can't create temporary file: No such file or directory
+         * Environment: use the EXPLICIT envp[] built from Kotlin's
+         * Array<String> ("KEY=VALUE"). Never pass NULL env to execve —
+         * that produced `$PATH=(null)` in proot diagnostics.
          * ------------------------------------------------------------------ */
-        setenv("HOME",  "/root", 1);
-        setenv("PATH",  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
-        setenv("TERM",  "xterm-256color", 1);
-        setenv("LANG",  "C.UTF-8", 1);
-        setenv("LC_ALL","C.UTF-8", 1);
-        setenv("USER",  "root", 1);
-        setenv("LOGNAME","root", 1);
-        setenv("SHELL", shellInGuest, 1);
-        setenv("PROOT_TMP_DIR", tmpDir, 1);
-        setenv("TMPDIR", tmpDir, 1);
-        if (filesDir) setenv("ANDROID_FILES_DIR", filesDir, 1);
+        if (envp == NULL) {
+            LOGE("child: envp is NULL — this must not happen (built pre-fork)");
+            _exit(126);
+        }
 
-        /* ------------------------------------------------------------------
-         * PRoot argument list (matches user spec):
-         *   proot -r <rootfs> -0 -b /dev -b /proc -b /sys
-         *         -b /dev/urandom:/dev/random -w /root <shell>
-         * Shell is chosen by detect_shell(): /bin/bash if present, else /bin/sh.
-         * ------------------------------------------------------------------ */
-        LOGI("child exec: %s -r %s -0 -b /dev -b /proc -b /sys "
+        /* Build argv for execve (proot + flags + shell) */
+        char *argv_proot[] = {
+            (char *) prootPath,
+            "-r", (char *) rootfsPath,
+            "-0",
+            "-b", "/dev",
+            "-b", "/proc",
+            "-b", "/sys",
+            "-b", "/dev/urandom:/dev/random",
+            "-w", "/root",
+            shellInGuest,          /* /bin/bash or /bin/sh — direct, no env */
+            NULL
+        };
+        char *argv_proot_retry[] = {
+            (char *) prootPath,
+            "-r", (char *) rootfsPath,
+            "-0",
+            "-b", "/dev",
+            "-b", "/proc",
+            "-b", "/sys",
+            "-b", "/dev/urandom:/dev/random",
+            shellInGuest,
+            NULL
+        };
+
+        LOGI("child execve: %s -r %s -0 -b /dev -b /proc -b /sys "
              "-b /dev/urandom:/dev/random -w /root %s",
              prootPath, rootfsPath, shellInGuest);
-        LOGI("child env: HOME=/root PATH=... TERM=xterm-256color LANG=C.UTF-8 "
-             "PROOT_TMP_DIR=%s SHELL=%s", tmpDir, shellInGuest);
+        {
+            int c = 0;
+            while (envp[c]) c++;
+            LOGI("child envp: %d entries (PATH, PROOT_TMP_DIR, HOME, TERM, ...)", c);
+        }
 
-        execl(prootPath, prootPath,
-              "-r", rootfsPath,
-              "-0",
-              "-b", "/dev",
-              "-b", "/proc",
-              "-b", "/sys",
-              "-b", "/dev/urandom:/dev/random",
-              "-w", "/root",
-              shellInGuest,          /* /bin/bash or /bin/sh — direct, no env */
-              (char *) NULL);
-
-        /* execl only returns on failure */
-        LOGE("execl(proot) failed: %s (errno=%d)", strerror(errno), errno);
+        execve(prootPath, argv_proot, envp);
+        LOGE("execve(proot) failed: %s (errno=%d)", strerror(errno), errno);
 
         /* Retry without -w /root (some proot builds reject unknown flags) */
-        execl(prootPath, prootPath,
-              "-r", rootfsPath,
-              "-0",
-              "-b", "/dev",
-              "-b", "/proc",
-              "-b", "/sys",
-              "-b", "/dev/urandom:/dev/random",
-              shellInGuest,
-              (char *) NULL);
-        LOGE("execl(proot) retry failed: %s", strerror(errno));
+        execve(prootPath, argv_proot_retry, envp);
+        LOGE("execve(proot) retry failed: %s", strerror(errno));
 
         /* Fallback: run libbash.so directly (no proot — test builds) */
         if (is_exec(bashPath)) {
-            LOGI("child fallback: exec %s", bashPath);
-            execl(bashPath, bashPath, (char *) NULL);
-            LOGE("execl(bash) failed: %s", strerror(errno));
+            char *argv_bash[] = { (char *) bashPath, NULL };
+            LOGI("child fallback: execve %s", bashPath);
+            execve(bashPath, argv_bash, envp);
+            LOGE("execve(bash) failed: %s", strerror(errno));
         }
 
         /* Last resort: Android system shell */
-        LOGI("child last resort: /system/bin/sh");
-        execl("/system/bin/sh", "sh", (char *) NULL);
+        {
+            char *argv_sh[] = { "sh", NULL };
+            LOGI("child last resort: /system/bin/sh");
+            execve("/system/bin/sh", argv_sh, envp);
+        }
         LOGE("ALL exec attempts failed: %s", strerror(errno));
         _exit(127);
     }
@@ -334,6 +420,7 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
     (*env)->ReleaseStringUTFChars(env, jFilesDir, filesDir);
     (*env)->ReleaseStringUTFChars(env, jNativeLibDir, nativeLibDir);
     (*env)->ReleaseStringUTFChars(env, jTmpDir, tmpDir);
+    free_envp(envp);
 
     return g_masterFd;
 
@@ -345,6 +432,7 @@ fail:
     (*env)->ReleaseStringUTFChars(env, jFilesDir, filesDir);
     (*env)->ReleaseStringUTFChars(env, jNativeLibDir, nativeLibDir);
     (*env)->ReleaseStringUTFChars(env, jTmpDir, tmpDir);
+    free_envp(envp);
     return -1;
 }
 

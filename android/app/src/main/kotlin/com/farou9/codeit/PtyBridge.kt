@@ -54,6 +54,7 @@ class PtyBridge(private val context: Context) {
         filesDir: String,
         nativeLibDir: String,
         tmpDir: String,
+        envp: Array<String>,
         cols: Int,
         rows: Int,
     ): Int  // returns fd or -1
@@ -136,9 +137,10 @@ class PtyBridge(private val context: Context) {
      *   libproot.so -r <rootfs> -0 -b /dev -b /proc -b /sys
      *               -b /dev/urandom:/dev/random -w /root <shell>
      *
-     * <shell> is /bin/bash if present in rootfs, else /bin/sh — never a broken
-     * /bin/busybox symlink. PATH/HOME/TERM/LANG and PROOT_TMP_DIR are set on
-     * the child via setenv() before execl so proot and the guest shell inherit them.
+     * <shell> is /bin/bash if present in rootfs, else /bin/sh — verified to
+     * exist BEFORE invoking proot. Environment is passed as an explicit
+     * `envp: Array<String>` ("KEY=VALUE") to execve — never a null env array
+     * (null env caused `$PATH=(null)` in proot diagnostics).
      */
     fun start(
         cols: Int,
@@ -164,6 +166,35 @@ class PtyBridge(private val context: Context) {
         }
         Log.i(TAG, "PROOT_TMP_DIR=${tmpDir.absolutePath}")
 
+        // ---- Verify rootfs extraction BEFORE proot ----
+        // File.exists() follows symlinks: a dangling /bin/sh → false.
+        val rootfsFile = File(rootfsPath)
+        if (!rootfsFile.exists() || !rootfsFile.isDirectory) {
+            lastError = "rootfs missing or not a directory at $rootfsPath — run SetupScreen first"
+            Log.e(TAG, lastError)
+            return false
+        }
+        val binSh = File(rootfsPath, "bin/sh")
+        val binBash = File(rootfsPath, "bin/bash")
+        val shOk = binSh.exists()
+        val bashOk = binBash.exists()
+        Log.i(TAG, "rootfs/bin/sh exists=$shOk path=${binSh.absolutePath}")
+        Log.i(TAG, "rootfs/bin/bash exists=$bashOk path=${binBash.absolutePath}")
+        // Diagnostic listing if shell missing
+        if (!shOk && !bashOk) {
+            val listing = File(rootfsPath, "bin").listFiles()
+                ?.joinToString { f ->
+                    val suffix = if (f.isDirectory) "/" else if (f.exists()) "" else " (broken?)"
+                    f.name + suffix
+                } ?: "(bin/ missing or empty)"
+            lastError = "Rootfs extraction incomplete: /bin/sh not found under " +
+                "$rootfsPath/bin. Contents: $listing. " +
+                "Re-run SetupScreen to re-extract the rootfs."
+            Log.e(TAG, lastError)
+            return false
+        }
+        Log.i(TAG, "rootfs OK: $rootfsPath (shell verified)")
+
         // ---- Resolve binaries (nativeLibraryDir → assets fallback) ----
         val prootPath = resolveBinary("libproot.so", nativeLibDir, filesDir)
         if (prootPath == null) {
@@ -181,24 +212,37 @@ class PtyBridge(private val context: Context) {
         // Shell selection mirrors pty_bridge.c detect_shell():
         // prefer /bin/bash if present in rootfs, else /bin/sh (never /bin/busybox)
         val shellInGuest = when {
-            File(rootfsPath, "bin/bash").exists() -> "/bin/bash"
+            binBash.exists() -> "/bin/bash"
             else -> "/bin/sh"
         }
         Log.i(TAG, "shell in guest: $shellInGuest")
 
-        // ---- Verify rootfs ----
-        val rootfsFile = File(rootfsPath)
-        if (!rootfsFile.exists() || !rootfsFile.isDirectory) {
-            lastError = "rootfs missing or not a directory at $rootfsPath — run SetupScreen first"
-            Log.e(TAG, lastError)
-            return false
-        }
-        Log.i(TAG, "rootfs OK: $rootfsPath")
+        // ---- Explicit envp for execve — NEVER null ----
+        // Converted to C char* envp[] as ["KEY=VALUE", ..., NULL].
+        val envMap = mapOf(
+            "PROOT_TMP_DIR" to tmpDir.absolutePath,
+            "TMPDIR" to tmpDir.absolutePath,
+            "HOME" to "/root",
+            "PATH" to "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "TERM" to "xterm-256color",
+            "LANG" to "en_US.UTF-8",
+            "LC_ALL" to "en_US.UTF-8",
+            "USER" to "root",
+            "LOGNAME" to "root",
+            "SHELL" to shellInGuest,
+            "ANDROID_FILES_DIR" to filesDir,
+        )
+        val envp: Array<String> = envMap.map { (k, v) -> "$k=$v" }.toTypedArray()
+        // Fail loudly if anything essential is missing
+        require(envp.isNotEmpty()) { "envp must not be empty" }
+        require(envp.any { it.startsWith("PATH=") }) { "envp missing PATH" }
+        require(envp.any { it.startsWith("PROOT_TMP_DIR=") }) { "envp missing PROOT_TMP_DIR" }
+        Log.i(TAG, "envp (${envp.size} entries): ${envp.joinToString(" | ")}")
 
         Log.i(
             TAG,
             "Starting PTY: proot=$prootPath bash=$bashPath rootfs=$rootfsPath " +
-                "tmpDir=${tmpDir.absolutePath} cols=$cols rows=$rows",
+                "tmpDir=${tmpDir.absolutePath} shell=$shellInGuest cols=$cols rows=$rows",
         )
 
         val fd = try {
@@ -209,6 +253,7 @@ class PtyBridge(private val context: Context) {
                 filesDir = filesDir,
                 nativeLibDir = nativeLibDir,
                 tmpDir = tmpDir.absolutePath,
+                envp = envp,
                 cols = cols,
                 rows = rows,
             )
