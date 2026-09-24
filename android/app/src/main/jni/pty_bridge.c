@@ -8,13 +8,15 @@
  *   <nativeLibDir>/libproot.so \
  *     -r <rootfs> -0 \
  *     -b /dev -b /proc -b /sys \
- *     /usr/bin/env -i \
- *       HOME=/root \
- *       PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
- *       TERM=xterm-256color \
- *       <shell>            # /bin/bash, /bin/sh, or /bin/busybox
+ *     -w /root \
+ *     <shell>                 # /bin/bash or /bin/sh — DIRECT exec, no env wrapper
  *
- * Shell fallback order inside rootfs:
+ * Environment (PATH/HOME/TERM/LANG) is set on the child via setenv()
+ * BEFORE execl, so proot and the guest shell inherit it. We do NOT use
+ * /usr/bin/env — minimal rootfs images often lack it, which caused:
+ *   proot error: '/usr/bin/env' not found ... $PATH=(null)
+ *
+ * Shell detection order inside rootfs (host-visible paths):
  *   1. /bin/bash   (Ubuntu, Debian)
  *   2. /bin/sh     (Alpine, minimal images)
  *   3. /bin/busybox (Alpine busybox symlinks)
@@ -82,6 +84,9 @@ static int file_exists(const char *path) {
  * Detect the best shell inside [rootfsDir].
  * Writes the guest path (e.g. "/bin/bash") into [out].
  * Returns 0 on success, -1 if no shell found.
+ *
+ * NOTE: We intentionally do NOT check /usr/bin/env — proot execs the
+ * shell path directly; env is provided via setenv() on the child.
  */
 static int detect_shell(const char *rootfsDir, char *out, size_t outLen) {
     const char *candidates[] = { "/bin/bash", "/bin/sh", "/bin/busybox", NULL };
@@ -103,17 +108,11 @@ static int detect_shell(const char *rootfsDir, char *out, size_t outLen) {
         }
     }
 
-    /* Last resort — check /usr/bin/env exists (busybox sometimes lives here) */
-    snprintf(hostPath, sizeof(hostPath), "%s/usr/bin/env", rootfsDir);
-    if (file_exists(hostPath)) {
-        snprintf(out, outLen, "/bin/sh");
-        LOGW("detect_shell: no standard shell, guessing /bin/sh (env exists)");
-        return 0;
-    }
-
-    set_error("No shell found inside rootfs %s (tried /bin/bash, /bin/sh, /bin/busybox)",
-              rootfsDir);
-    return -1;
+    /* Last resort: assume /bin/sh (busybox symlink may appear after mount) */
+    snprintf(out, outLen, "/bin/sh");
+    LOGW("detect_shell: no shell binary found under %s — defaulting to /bin/sh",
+         rootfsDir);
+    return 0;
 }
 
 /* --------------------------------------------------------------------------
@@ -222,18 +221,31 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
         dup2(slaveFd, STDERR_FILENO);
         if (slaveFd > 2) close(slaveFd);
 
-        /* Environment for the child (proot itself) */
-        setenv("TERM", "xterm-256color", 1);
-        setenv("HOME", "/root", 1);
-        setenv("USER", "root", 1);
+        /* ------------------------------------------------------------------
+         * Environment for the child process (proot + guest shell inherit).
+         * setenv before execl — NO /usr/bin/env wrapper (minimal rootfs
+         * images often lack /usr/bin/env, which caused:
+         *   proot error: '/usr/bin/env' not found ... $PATH=(null))
+         * ------------------------------------------------------------------ */
+        setenv("HOME",  "/root", 1);
+        setenv("PATH",  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+        setenv("TERM",  "xterm-256color", 1);
+        setenv("LANG",  "C.UTF-8", 1);
+        setenv("LC_ALL","C.UTF-8", 1);
+        setenv("USER",  "root", 1);
+        setenv("LOGNAME","root", 1);
         setenv("SHELL", shellInGuest, 1);
-        setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
         if (filesDir) setenv("ANDROID_FILES_DIR", filesDir, 1);
 
-        /* Build proot argument vector */
-        LOGI("child exec: %s -r %s -0 -b /dev -b /proc -b /sys "
-             "/usr/bin/env -i HOME=/root PATH=... TERM=... %s",
+        /* ------------------------------------------------------------------
+         * PRoot argument list (matches user spec):
+         *   proot -r <rootfs> -0 -b /dev -b /proc -b /sys -w /root <shell>
+         * Shell is chosen by detect_shell(): /bin/bash if present, else /bin/sh.
+         * ------------------------------------------------------------------ */
+        LOGI("child exec: %s -r %s -0 -b /dev -b /proc -b /sys -w /root %s",
              prootPath, rootfsPath, shellInGuest);
+        LOGI("child env: HOME=/root PATH=... TERM=xterm-256color LANG=C.UTF-8 SHELL=%s",
+             shellInGuest);
 
         execl(prootPath, prootPath,
               "-r", rootfsPath,
@@ -241,38 +253,28 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
               "-b", "/dev",
               "-b", "/proc",
               "-b", "/sys",
-              /* Optional: host Download dir (proot warns if missing, continues) */
-              "-b", "/sdcard/Download:/mnt/download",
               "-w", "/root",
-              /* Clean guest environment via /usr/bin/env -i */
-              "/usr/bin/env", "-i",
-              "HOME=/root",
-              "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-              "TERM=xterm-256color",
-              shellInGuest,
+              shellInGuest,          /* /bin/bash or /bin/sh — direct, no env */
               (char *) NULL);
 
         /* execl only returns on failure */
-        LOGE("execl(proot) failed: %s (errno=%d) — trying without env wrapper",
-             strerror(errno), errno);
+        LOGE("execl(proot) failed: %s (errno=%d)", strerror(errno), errno);
 
-        /* Retry without /usr/bin/env (in case rootfs lacks it) */
+        /* Retry without -w /root (some proot builds reject unknown flags) */
         execl(prootPath, prootPath,
               "-r", rootfsPath,
               "-0",
               "-b", "/dev",
               "-b", "/proc",
               "-b", "/sys",
-              "-b", "/sdcard/Download:/mnt/download",
-              "-w", "/root",
               shellInGuest,
               (char *) NULL);
         LOGE("execl(proot) retry failed: %s", strerror(errno));
 
-        /* Fallback: run libbash.so directly (no proot — test builds) */
+        /* Fallback: run libbash.so / busybox directly (no proot — test builds) */
         if (is_exec(bashPath)) {
-            LOGI("child fallback: exec %s --login", bashPath);
-            execl(bashPath, "bash", "--login", (char *) NULL);
+            LOGI("child fallback: exec %s", bashPath);
+            execl(bashPath, bashPath, (char *) NULL);
             LOGE("execl(bash) failed: %s", strerror(errno));
         }
 

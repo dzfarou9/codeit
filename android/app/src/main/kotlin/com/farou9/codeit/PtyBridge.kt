@@ -130,10 +130,13 @@ class PtyBridge(private val context: Context) {
      * Start the PRoot session.
      *
      * Resolves libproot.so / libbash.so via [resolveBinary] (nativeLibraryDir
-     * first, Flutter assets → filesDir/bin fallback). Constructs the proot
-     * invocation in native code:
-     *   libproot.so -r <rootfs> -0 -b /dev -b /proc -b /sys
-     *               /usr/bin/env -i HOME=… PATH=… TERM=… <shell>
+     * first, Flutter assets → filesDir/bin fallback). The proot invocation is
+     * built in native code (pty_bridge.c):
+     *   libproot.so -r <rootfs> -0 -b /dev -b /proc -b /sys -w /root <shell>
+     *
+     * <shell> is /bin/bash if present in rootfs, else /bin/sh — exec'd
+     * DIRECTLY (no /usr/bin/env wrapper). PATH/HOME/TERM/LANG are set on the
+     * child via setenv() before execl so proot and the guest shell inherit them.
      */
     fun start(
         cols: Int,
@@ -163,6 +166,15 @@ class PtyBridge(private val context: Context) {
         val bashPath = resolveBinary("libbash.so", nativeLibDir, filesDir)
             ?: "$nativeLibDir/libbash.so"
         Log.i(TAG, "binaries: proot=$prootPath bash=$bashPath")
+
+        // Shell selection mirrors pty_bridge.c detect_shell():
+        // prefer /bin/bash if present in rootfs, else /bin/sh
+        val shellInGuest = when {
+            File(rootfsPath, "bin/bash").exists() -> "/bin/bash"
+            File(rootfsPath, "bin/sh").exists() -> "/bin/sh"
+            else -> "/bin/sh"
+        }
+        Log.i(TAG, "shell in guest: $shellInGuest")
 
         // ---- Verify rootfs ----
         val rootfsFile = File(rootfsPath)
