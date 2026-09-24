@@ -21,7 +21,7 @@
     <application
         android:label="codeit"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@drawable/ic_launcher"
         android:extractNativeLibs="true"
         android:requestLegacyExternalStorage="false"
         android:allowBackup="false">
