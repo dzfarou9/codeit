@@ -57,28 +57,38 @@ codeit/
 
 ## Prerequisites — Populating jniLibs
 
-This repo ships `jniLibs/arm64-v8a/README.md` as a placeholder. Before building, populate:
+**One command** (downloads static Alpine `proot` + `busybox` into both
+`jniLibs/arm64-v8a/` and `assets/bin/`):
 
 ```bash
-# Option A: fetch script (also mirrors into assets/bin/ fallback)
-PROOT_URL=... BUSYBOX_URL=... BSDTAR_URL=... ./scripts/fetch-native-binaries.sh
-
-# Option B: manually copy static aarch64 binaries:
-#   proot     → android/app/src/main/jniLibs/arm64-v8a/libproot.so
-#   bash/busybox → android/app/src/main/jniLibs/arm64-v8a/libbash.so
-#   bsdtar    → android/app/src/main/jniLibs/arm64-v8a/libtar.so
-#   (optional fallback) same three files → assets/bin/
-#
-# libpty.so is built automatically by CMake — no manual step.
+bash scripts/fetch-native-binaries.sh
 ```
 
-Also copy the same three binaries into `assets/bin/` if you want the Kotlin
-assets→`filesDir/bin` fallback to work.
+Defaults:
 
-Verify `.so` are packaged in the APK:
+| File | Source |
+|---|---|
+| `libproot.so` | Alpine `proot-static-5.4.0-r2.aarch64` (static ELF) |
+| `libbash.so` | Alpine `busybox-static-1.38.0-r7.aarch64` (static ELF) |
+| `libtar.so` | *optional* — Dart `ArchiveExtractor` is the fallback |
+| `libpty.so` | built by CMake via `externalNativeBuild` — automatic |
+
+Manual equivalent:
+
 ```bash
-unzip -lv build/app/outputs/flutter-apk/app-release.apk | grep 'lib/arm64-v8a/.*\.so'
-# Should list libproot.so, libbash.so, libtar.so, libpty.so, libflutter.so, libapp.so
+curl -fL -o /tmp/p.apk https://dl-cdn.alpinelinux.org/alpine/edge/community/aarch64/proot-static-5.4.0-r2.apk
+tar -xzf /tmp/p.apk -C /tmp
+cp /tmp/usr/bin/proot.static android/app/src/main/jniLibs/arm64-v8a/libproot.so
+cp /tmp/usr/bin/proot.static assets/bin/libproot.so
+chmod 755 android/app/src/main/jniLibs/arm64-v8a/libproot.so assets/bin/libproot.so
+# Repeat for busybox-static → libbash.so
+```
+
+Verify after build:
+
+```bash
+unzip -lv build/app/outputs/flutter-apk/app-release.apk | grep 'lib/arm64-v8a/'
+# Must list: libproot.so  libbash.so  libpty.so  libflutter.so  libapp.so
 ```
 
 ## Initialization
