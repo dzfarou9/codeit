@@ -53,6 +53,7 @@ class PtyBridge(private val context: Context) {
         rootfsPath: String,
         filesDir: String,
         nativeLibDir: String,
+        tmpDir: String,
         cols: Int,
         rows: Int,
     ): Int  // returns fd or -1
@@ -132,11 +133,12 @@ class PtyBridge(private val context: Context) {
      * Resolves libproot.so / libbash.so via [resolveBinary] (nativeLibraryDir
      * first, Flutter assets → filesDir/bin fallback). The proot invocation is
      * built in native code (pty_bridge.c):
-     *   libproot.so -r <rootfs> -0 -b /dev -b /proc -b /sys -w /root <shell>
+     *   libproot.so -r <rootfs> -0 -b /dev -b /proc -b /sys
+     *               -b /dev/urandom:/dev/random -w /root <shell>
      *
-     * <shell> is /bin/bash if present in rootfs, else /bin/sh — exec'd
-     * DIRECTLY (no /usr/bin/env wrapper). PATH/HOME/TERM/LANG are set on the
-     * child via setenv() before execl so proot and the guest shell inherit them.
+     * <shell> is /bin/bash if present in rootfs, else /bin/sh — never a broken
+     * /bin/busybox symlink. PATH/HOME/TERM/LANG and PROOT_TMP_DIR are set on
+     * the child via setenv() before execl so proot and the guest shell inherit them.
      */
     fun start(
         cols: Int,
@@ -153,6 +155,15 @@ class PtyBridge(private val context: Context) {
 
         lastError = ""
 
+        // ---- PROOT_TMP_DIR — proot needs a writable host dir for temp files ----
+        val tmpDir = File(filesDir, "tmp").apply { mkdirs() }
+        if (!tmpDir.isDirectory) {
+            lastError = "Cannot create PROOT_TMP_DIR at ${tmpDir.absolutePath}"
+            Log.e(TAG, lastError)
+            return false
+        }
+        Log.i(TAG, "PROOT_TMP_DIR=${tmpDir.absolutePath}")
+
         // ---- Resolve binaries (nativeLibraryDir → assets fallback) ----
         val prootPath = resolveBinary("libproot.so", nativeLibDir, filesDir)
         if (prootPath == null) {
@@ -162,16 +173,15 @@ class PtyBridge(private val context: Context) {
             return false
         }
 
-        // libbash.so is optional — C code falls back to /bin/sh, /bin/busybox, /system/bin/sh
+        // libbash.so is optional — C code falls back to /bin/sh, /system/bin/sh
         val bashPath = resolveBinary("libbash.so", nativeLibDir, filesDir)
             ?: "$nativeLibDir/libbash.so"
         Log.i(TAG, "binaries: proot=$prootPath bash=$bashPath")
 
         // Shell selection mirrors pty_bridge.c detect_shell():
-        // prefer /bin/bash if present in rootfs, else /bin/sh
+        // prefer /bin/bash if present in rootfs, else /bin/sh (never /bin/busybox)
         val shellInGuest = when {
             File(rootfsPath, "bin/bash").exists() -> "/bin/bash"
-            File(rootfsPath, "bin/sh").exists() -> "/bin/sh"
             else -> "/bin/sh"
         }
         Log.i(TAG, "shell in guest: $shellInGuest")
@@ -185,7 +195,11 @@ class PtyBridge(private val context: Context) {
         }
         Log.i(TAG, "rootfs OK: $rootfsPath")
 
-        Log.i(TAG, "Starting PTY: proot=$prootPath bash=$bashPath rootfs=$rootfsPath cols=$cols rows=$rows")
+        Log.i(
+            TAG,
+            "Starting PTY: proot=$prootPath bash=$bashPath rootfs=$rootfsPath " +
+                "tmpDir=${tmpDir.absolutePath} cols=$cols rows=$rows",
+        )
 
         val fd = try {
             nativePtyStart(
@@ -194,6 +208,7 @@ class PtyBridge(private val context: Context) {
                 rootfsPath = rootfsPath,
                 filesDir = filesDir,
                 nativeLibDir = nativeLibDir,
+                tmpDir = tmpDir.absolutePath,
                 cols = cols,
                 rows = rows,
             )

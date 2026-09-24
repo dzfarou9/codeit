@@ -8,18 +8,23 @@
  *   <nativeLibDir>/libproot.so \
  *     -r <rootfs> -0 \
  *     -b /dev -b /proc -b /sys \
+ *     -b /dev/urandom:/dev/random \
  *     -w /root \
  *     <shell>                 # /bin/bash or /bin/sh — DIRECT exec, no env wrapper
  *
- * Environment (PATH/HOME/TERM/LANG) is set on the child via setenv()
- * BEFORE execl, so proot and the guest shell inherit it. We do NOT use
- * /usr/bin/env — minimal rootfs images often lack it, which caused:
+ * Environment (PATH/HOME/TERM/LANG/PROOT_TMP_DIR) is set on the child via
+ * setenv() BEFORE execl, so proot and the guest shell inherit it. We do NOT
+ * use /usr/bin/env — minimal rootfs images often lack it, which caused:
  *   proot error: '/usr/bin/env' not found ... $PATH=(null)
+ *
+ * PROOT_TMP_DIR points at <filesDir>/tmp (created in Kotlin) so proot can
+ * create temporary files (else: "can't create temporary file").
  *
  * Shell detection order inside rootfs (host-visible paths):
  *   1. /bin/bash   (Ubuntu, Debian)
  *   2. /bin/sh     (Alpine, minimal images)
- *   3. /bin/busybox (Alpine busybox symlinks)
+ *   /bin/busybox is intentionally NOT probed — broken symlinks caused
+ *   execve("/bin/busybox"): No such file or directory.
  *
  * Every failure path logs errno + context via __android_log_print so
  * logcat tag "PtyBridge-JNI" shows the exact failing call.
@@ -83,13 +88,17 @@ static int file_exists(const char *path) {
 /**
  * Detect the best shell inside [rootfsDir].
  * Writes the guest path (e.g. "/bin/bash") into [out].
- * Returns 0 on success, -1 if no shell found.
+ * Always returns 0 (default "/bin/sh").
+ *
+ * Candidates: /bin/bash, /bin/sh only. We never probe /bin/busybox —
+ * Alpine images often have a broken/missing busybox path which caused:
+ *   proot error: execve("/bin/busybox"): No such file or directory
  *
  * NOTE: We intentionally do NOT check /usr/bin/env — proot execs the
  * shell path directly; env is provided via setenv() on the child.
  */
 static int detect_shell(const char *rootfsDir, char *out, size_t outLen) {
-    const char *candidates[] = { "/bin/bash", "/bin/sh", "/bin/busybox", NULL };
+    const char *candidates[] = { "/bin/bash", "/bin/sh", NULL };
     char hostPath[1024];
 
     for (int i = 0; candidates[i] != NULL; i++) {
@@ -108,9 +117,9 @@ static int detect_shell(const char *rootfsDir, char *out, size_t outLen) {
         }
     }
 
-    /* Last resort: assume /bin/sh (busybox symlink may appear after mount) */
+    /* Default: /bin/sh (present in virtually every rootfs) */
     snprintf(out, outLen, "/bin/sh");
-    LOGW("detect_shell: no shell binary found under %s — defaulting to /bin/sh",
+    LOGW("detect_shell: no /bin/bash or /bin/sh under %s — defaulting to /bin/sh",
          rootfsDir);
     return 0;
 }
@@ -123,7 +132,7 @@ JNIEXPORT jint JNICALL
 Java_com_farou9_codeit_PtyBridge_nativePtyStart(
         JNIEnv *env, jobject thiz,
         jstring jProotPath, jstring jBashPath, jstring jRootfsPath,
-        jstring jFilesDir, jstring jNativeLibDir,
+        jstring jFilesDir, jstring jNativeLibDir, jstring jTmpDir,
         jint cols, jint rows) {
 
     const char *prootPath    = (*env)->GetStringUTFChars(env, jProotPath, NULL);
@@ -131,6 +140,7 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
     const char *rootfsPath   = (*env)->GetStringUTFChars(env, jRootfsPath, NULL);
     const char *filesDir     = (*env)->GetStringUTFChars(env, jFilesDir, NULL);
     const char *nativeLibDir = (*env)->GetStringUTFChars(env, jNativeLibDir, NULL);
+    const char *tmpDir       = (*env)->GetStringUTFChars(env, jTmpDir, NULL);
 
     g_lastError[0] = '\0';
 
@@ -140,6 +150,7 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
     LOGI("  rootfsPath   = %s", rootfsPath);
     LOGI("  filesDir     = %s", filesDir);
     LOGI("  nativeLibDir = %s", nativeLibDir);
+    LOGI("  tmpDir       = %s", tmpDir);
     LOGI("  cols=%d rows=%d", cols, rows);
 
     /* ---- Pre-flight binary verification ---- */
@@ -162,6 +173,21 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
         goto fail;
     }
     LOGI("rootfs OK: %s", rootfsPath);
+
+    /* ---- PROOT_TMP_DIR — writable host dir for proot temp files ---- */
+    if (tmpDir == NULL || tmpDir[0] == '\0') {
+        set_error("PROOT_TMP_DIR empty — pass filesDir/tmp from Kotlin");
+        goto fail;
+    }
+    if (mkdir(tmpDir, 0700) != 0 && errno != EEXIST) {
+        set_error("mkdir(%s) for PROOT_TMP_DIR failed: %s", tmpDir, strerror(errno));
+        goto fail;
+    }
+    if (access(tmpDir, W_OK) != 0) {
+        set_error("PROOT_TMP_DIR not writable: %s (%s)", tmpDir, strerror(errno));
+        goto fail;
+    }
+    LOGI("PROOT_TMP_DIR OK: %s", tmpDir);
 
     /* ---- Detect shell inside rootfs ---- */
     char shellInGuest[256];
@@ -226,6 +252,9 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
          * setenv before execl — NO /usr/bin/env wrapper (minimal rootfs
          * images often lack /usr/bin/env, which caused:
          *   proot error: '/usr/bin/env' not found ... $PATH=(null))
+         *
+         * PROOT_TMP_DIR is required — without it proot fails:
+         *   can't create temporary file: No such file or directory
          * ------------------------------------------------------------------ */
         setenv("HOME",  "/root", 1);
         setenv("PATH",  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
@@ -235,17 +264,21 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
         setenv("USER",  "root", 1);
         setenv("LOGNAME","root", 1);
         setenv("SHELL", shellInGuest, 1);
+        setenv("PROOT_TMP_DIR", tmpDir, 1);
+        setenv("TMPDIR", tmpDir, 1);
         if (filesDir) setenv("ANDROID_FILES_DIR", filesDir, 1);
 
         /* ------------------------------------------------------------------
          * PRoot argument list (matches user spec):
-         *   proot -r <rootfs> -0 -b /dev -b /proc -b /sys -w /root <shell>
+         *   proot -r <rootfs> -0 -b /dev -b /proc -b /sys
+         *         -b /dev/urandom:/dev/random -w /root <shell>
          * Shell is chosen by detect_shell(): /bin/bash if present, else /bin/sh.
          * ------------------------------------------------------------------ */
-        LOGI("child exec: %s -r %s -0 -b /dev -b /proc -b /sys -w /root %s",
+        LOGI("child exec: %s -r %s -0 -b /dev -b /proc -b /sys "
+             "-b /dev/urandom:/dev/random -w /root %s",
              prootPath, rootfsPath, shellInGuest);
-        LOGI("child env: HOME=/root PATH=... TERM=xterm-256color LANG=C.UTF-8 SHELL=%s",
-             shellInGuest);
+        LOGI("child env: HOME=/root PATH=... TERM=xterm-256color LANG=C.UTF-8 "
+             "PROOT_TMP_DIR=%s SHELL=%s", tmpDir, shellInGuest);
 
         execl(prootPath, prootPath,
               "-r", rootfsPath,
@@ -253,6 +286,7 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
               "-b", "/dev",
               "-b", "/proc",
               "-b", "/sys",
+              "-b", "/dev/urandom:/dev/random",
               "-w", "/root",
               shellInGuest,          /* /bin/bash or /bin/sh — direct, no env */
               (char *) NULL);
@@ -267,11 +301,12 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
               "-b", "/dev",
               "-b", "/proc",
               "-b", "/sys",
+              "-b", "/dev/urandom:/dev/random",
               shellInGuest,
               (char *) NULL);
         LOGE("execl(proot) retry failed: %s", strerror(errno));
 
-        /* Fallback: run libbash.so / busybox directly (no proot — test builds) */
+        /* Fallback: run libbash.so directly (no proot — test builds) */
         if (is_exec(bashPath)) {
             LOGI("child fallback: exec %s", bashPath);
             execl(bashPath, bashPath, (char *) NULL);
@@ -298,6 +333,7 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
     (*env)->ReleaseStringUTFChars(env, jRootfsPath, rootfsPath);
     (*env)->ReleaseStringUTFChars(env, jFilesDir, filesDir);
     (*env)->ReleaseStringUTFChars(env, jNativeLibDir, nativeLibDir);
+    (*env)->ReleaseStringUTFChars(env, jTmpDir, tmpDir);
 
     return g_masterFd;
 
@@ -308,6 +344,7 @@ fail:
     (*env)->ReleaseStringUTFChars(env, jRootfsPath, rootfsPath);
     (*env)->ReleaseStringUTFChars(env, jFilesDir, filesDir);
     (*env)->ReleaseStringUTFChars(env, jNativeLibDir, nativeLibDir);
+    (*env)->ReleaseStringUTFChars(env, jTmpDir, tmpDir);
     return -1;
 }
 
