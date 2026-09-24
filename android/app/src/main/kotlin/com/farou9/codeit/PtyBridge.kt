@@ -39,6 +39,11 @@ class PtyBridge(private val context: Context) {
     private val running = AtomicBoolean(false)
     private var readerThread: Thread? = null
 
+    /** Last failure message — set by [start], read by MainActivity for PTY_START_FAILED. */
+    @Volatile
+    var lastError: String = ""
+        private set
+
     // ---- JNI declarations (implemented in src/main/jni/pty_bridge.c) ----
     private external fun nativePtyStart(
         prootPath: String,
@@ -54,6 +59,7 @@ class PtyBridge(private val context: Context) {
     private external fun nativePtyResize(cols: Int, rows: Int): Int
     private external fun nativePtyKill()
     private external fun nativePtyGetFd(): Int
+    private external fun nativePtyGetLastError(): String
 
     /**
      * Start the PRoot session.
@@ -82,35 +88,69 @@ class PtyBridge(private val context: Context) {
         val bashPath = "$nativeLibDir/libbash.so"
         // libtar.so is used separately during setup extraction (not here)
 
-        if (!File(prootPath).exists()) {
-            Log.e(TAG, "libproot.so not found at $prootPath — did you place it in jniLibs?")
+        lastError = ""
+
+        // ---- Verify libproot.so ----
+        val prootFile = File(prootPath)
+        if (!prootFile.exists()) {
+            val listing = File(nativeLibDir).listFiles()
+                ?.joinToString { f -> f.name } ?: "(empty or unreadable)"
+            lastError = "libproot.so missing at $prootPath | nativeLibraryDir contents: $listing"
+            Log.e(TAG, lastError)
             return false
         }
-        if (!File(rootfsPath).exists()) {
-            Log.e(TAG, "rootfs not found at $rootfsPath — run SetupScreen first")
+        if (!prootFile.canExecute()) {
+            Log.w(TAG, "libproot.so not +x at $prootPath — attempting setExecutable(true)")
+            prootFile.setExecutable(true)
+            if (!prootFile.canExecute()) {
+                lastError = "libproot.so not executable at $prootPath (setExecutable failed)"
+                Log.e(TAG, lastError)
+                return false
+            }
+        }
+        Log.i(TAG, "libproot.so OK: $prootPath (canExecute=true)")
+
+        // ---- Verify rootfs ----
+        val rootfsFile = File(rootfsPath)
+        if (!rootfsFile.exists() || !rootfsFile.isDirectory) {
+            lastError = "rootfs missing or not a directory at $rootfsPath — run SetupScreen first"
+            Log.e(TAG, lastError)
             return false
         }
+        Log.i(TAG, "rootfs OK: $rootfsPath")
 
-        Log.i(TAG, "Starting PTY: proot=$prootPath rootfs=$rootfsPath cols=$cols rows=$rows")
+        Log.i(TAG, "Starting PTY: proot=$prootPath bash=$bashPath rootfs=$rootfsPath cols=$cols rows=$rows")
 
-        val fd = nativePtyStart(
-            prootPath = prootPath,
-            bashPath = bashPath,
-            rootfsPath = rootfsPath,
-            filesDir = filesDir,
-            nativeLibDir = nativeLibDir,
-            cols = cols,
-            rows = rows,
-        )
+        val fd = try {
+            nativePtyStart(
+                prootPath = prootPath,
+                bashPath = bashPath,
+                rootfsPath = rootfsPath,
+                filesDir = filesDir,
+                nativeLibDir = nativeLibDir,
+                cols = cols,
+                rows = rows,
+            )
+        } catch (e: Throwable) {
+            lastError = "nativePtyStart threw: ${e.javaClass.simpleName}: ${e.message}"
+            Log.e(TAG, lastError, e)
+            return false
+        }
 
         if (fd < 0) {
-            Log.e(TAG, "nativePtyStart failed: fd=$fd")
+            val nativeMsg = try { nativePtyGetLastError() } catch (_: Throwable) { "" }
+            lastError = if (nativeMsg.isNotEmpty()) {
+                "nativePtyStart failed (fd=$fd): $nativeMsg"
+            } else {
+                "nativePtyStart failed (fd=$fd) — see logcat tag PtyBridge-JNI for errno/exit detail"
+            }
+            Log.e(TAG, lastError)
             return false
         }
 
         running.set(true)
         startReaderLoop()
-        Log.i(TAG, "PTY started, fd=$fd")
+        Log.i(TAG, "PTY started, fd=$fd pid=${try { nativePtyGetFd() } catch (_: Throwable) { -1 }}")
         return true
     }
 

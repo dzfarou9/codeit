@@ -1,6 +1,7 @@
 package com.farou9.codeit
 
 import android.os.Bundle
+import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -18,6 +19,7 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
 
     companion object {
+        private const val TAG = "MainActivity"
         const val METHOD_CHANNEL = "com.farou9.codeit/engine"
         const val EVENT_CHANNEL = "com.farou9.codeit/ptyOutput"
     }
@@ -91,8 +93,15 @@ class MainActivity : FlutterActivity() {
                                 nativeLibDir = applicationInfo.nativeLibraryDir,
                                 rootfsPath = rootfsPath,
                             )
-                            if (ok) result.success(true)
-                            else result.error("PTY_START_FAILED", "native start returned false", null)
+                            if (ok) {
+                                result.success(true)
+                            } else {
+                                val detail = ptyBridge!!.lastError.ifEmpty {
+                                    "native start returned false (no detail captured)"
+                                }
+                                Log.e(TAG, "startPty failed: $detail")
+                                result.error("PTY_START_FAILED", detail, null)
+                            }
                         } catch (e: Exception) {
                             result.error("PTY_START_EXCEPTION", e.message, e.stackTraceToString())
                         }

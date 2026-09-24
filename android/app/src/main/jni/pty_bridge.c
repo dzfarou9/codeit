@@ -1,23 +1,26 @@
 /**
  * pty_bridge.c — JNI PTY bridge for codeit (com.farou9.codeit)
  *
- * Creates a pseudo-terminal (PTY) and spawns proot+bash inside it.
+ * Creates a pseudo-terminal (PTY) and spawns proot + shell inside it.
  * All binaries are resolved from nativeLibraryDir (W^X compliant).
  *
- * Build with NDK:
- *   ndk-build  or  CMake (see CMakeLists.txt)
- * Output: libpty.so -> jniLibs/arm64-v8a/libpty.so
- *
- * PRoot invocation:
+ * PRoot invocation (guest paths, resolved inside rootfs by proot):
  *   <nativeLibDir>/libproot.so \
  *     -r <rootfs> -0 \
  *     -b /dev -b /proc -b /sys \
- *     -b /sdcard/Download:/mnt/download \
- *     -b <filesDir>:/host \
- *     -w /root \
- *     /bin/bash --login
+ *     /usr/bin/env -i \
+ *       HOME=/root \
+ *       PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+ *       TERM=xterm-256color \
+ *       <shell>            # /bin/bash, /bin/sh, or /bin/busybox
  *
- * If proot is unavailable (test builds), falls back to libbash.so directly.
+ * Shell fallback order inside rootfs:
+ *   1. /bin/bash   (Ubuntu, Debian)
+ *   2. /bin/sh     (Alpine, minimal images)
+ *   3. /bin/busybox (Alpine busybox symlinks)
+ *
+ * Every failure path logs errno + context via __android_log_print so
+ * logcat tag "PtyBridge-JNI" shows the exact failing call.
  */
 
 #include <jni.h>
@@ -30,44 +33,92 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <termios.h>
-#include <pty.h>          // openpty()
+#include <pty.h>
 #include <sys/types.h>
+#include <stdarg.h>
 
 #define LOG_TAG "PtyBridge-JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
-// Global state — one PTY session at a time (single terminal)
+/* Global state — one PTY session at a time */
 static int g_masterFd = -1;
-static int g_slaveFd  = -1;
-static pid_t g_childPid = -1;
-
-// Forward
-static void set_winsize(int fd, int cols, int rows);
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-static int file_exists(const char *path) {
-    return access(path, X_OK) == 0;
-}
+static int g_childPid  = -1;
+static char g_lastError[512] = {0};
 
 static void set_winsize(int fd, int cols, int rows) {
     struct winsize ws;
-    ws.ws_col = (unsigned short) cols;
-    ws.ws_row = (unsigned short) rows;
+    ws.ws_col   = (unsigned short) cols;
+    ws.ws_row   = (unsigned short) rows;
     ws.ws_xpixel = 0;
     ws.ws_ypixel = 0;
     ioctl(fd, TIOCSWINSZ, &ws);
 }
 
-// ---------------------------------------------------------------------------
-// JNI: nativePtyStart
-// ---------------------------------------------------------------------------
-// Signature: (Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;II)I
+static void set_error(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_lastError, sizeof(g_lastError), fmt, ap);
+    va_end(ap);
+    LOGE("%s", g_lastError);
+}
+
+/* Check file exists and is executable (F_OK first, then X_OK). */
+static int is_exec(const char *path) {
+    if (access(path, F_OK) != 0) return 0;
+    if (access(path, X_OK) != 0) return 0;
+    return 1;
+}
+
+static int file_exists(const char *path) {
+    return access(path, F_OK) == 0;
+}
+
+/**
+ * Detect the best shell inside [rootfsDir].
+ * Writes the guest path (e.g. "/bin/bash") into [out].
+ * Returns 0 on success, -1 if no shell found.
+ */
+static int detect_shell(const char *rootfsDir, char *out, size_t outLen) {
+    const char *candidates[] = { "/bin/bash", "/bin/sh", "/bin/busybox", NULL };
+    char hostPath[1024];
+
+    for (int i = 0; candidates[i] != NULL; i++) {
+        snprintf(hostPath, sizeof(hostPath), "%s%s", rootfsDir, candidates[i]);
+        if (is_exec(hostPath)) {
+            snprintf(out, outLen, "%s", candidates[i]);
+            LOGI("detect_shell: found %s (host=%s)", candidates[i], hostPath);
+            return 0;
+        }
+        /* Also accept a plain file (not +x yet — proot/chmod may fix later) */
+        if (file_exists(hostPath)) {
+            snprintf(out, outLen, "%s", candidates[i]);
+            LOGW("detect_shell: %s exists but not +x (host=%s) — using anyway",
+                 candidates[i], hostPath);
+            return 0;
+        }
+    }
+
+    /* Last resort — check /usr/bin/env exists (busybox sometimes lives here) */
+    snprintf(hostPath, sizeof(hostPath), "%s/usr/bin/env", rootfsDir);
+    if (file_exists(hostPath)) {
+        snprintf(out, outLen, "/bin/sh");
+        LOGW("detect_shell: no standard shell, guessing /bin/sh (env exists)");
+        return 0;
+    }
+
+    set_error("No shell found inside rootfs %s (tried /bin/bash, /bin/sh, /bin/busybox)",
+              rootfsDir);
+    return -1;
+}
+
+/* --------------------------------------------------------------------------
+ * JNI: nativePtyStart
+ * -------------------------------------------------------------------------- */
 
 JNIEXPORT jint JNICALL
 Java_com_farou9_codeit_PtyBridge_nativePtyStart(
@@ -76,15 +127,51 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
         jstring jFilesDir, jstring jNativeLibDir,
         jint cols, jint rows) {
 
-    const char *prootPath   = (*env)->GetStringUTFChars(env, jProotPath, NULL);
-    const char *bashPath    = (*env)->GetStringUTFChars(env, jBashPath, NULL);
-    const char *rootfsPath  = (*env)->GetStringUTFChars(env, jRootfsPath, NULL);
-    const char *filesDir    = (*env)->GetStringUTFChars(env, jFilesDir, NULL);
-    const char *nativeLibDir= (*env)->GetStringUTFChars(env, jNativeLibDir, NULL);
+    const char *prootPath    = (*env)->GetStringUTFChars(env, jProotPath, NULL);
+    const char *bashPath     = (*env)->GetStringUTFChars(env, jBashPath, NULL);
+    const char *rootfsPath   = (*env)->GetStringUTFChars(env, jRootfsPath, NULL);
+    const char *filesDir     = (*env)->GetStringUTFChars(env, jFilesDir, NULL);
+    const char *nativeLibDir = (*env)->GetStringUTFChars(env, jNativeLibDir, NULL);
 
-    LOGI("nativePtyStart proot=%s rootfs=%s cols=%d rows=%d", prootPath, rootfsPath, cols, rows);
+    g_lastError[0] = '\0';
 
-    // Clean previous session
+    LOGI("=== nativePtyStart begin ===");
+    LOGI("  prootPath    = %s", prootPath);
+    LOGI("  bashPath     = %s", bashPath);
+    LOGI("  rootfsPath   = %s", rootfsPath);
+    LOGI("  filesDir     = %s", filesDir);
+    LOGI("  nativeLibDir = %s", nativeLibDir);
+    LOGI("  cols=%d rows=%d", cols, rows);
+
+    /* ---- Pre-flight binary verification ---- */
+    if (!file_exists(prootPath)) {
+        set_error("libproot.so MISSING at %s — place it in jniLibs/arm64-v8a/", prootPath);
+        goto fail;
+    }
+    if (!is_exec(prootPath)) {
+        LOGW("libproot.so exists but not +x at %s — attempting chmod", prootPath);
+        if (chmod(prootPath, 0755) != 0) {
+            set_error("libproot.so not executable and chmod failed (%s): %s",
+                      prootPath, strerror(errno));
+            goto fail;
+        }
+    }
+    LOGI("libproot.so OK: %s", prootPath);
+
+    if (!file_exists(rootfsPath)) {
+        set_error("rootfs MISSING at %s — run SetupScreen first", rootfsPath);
+        goto fail;
+    }
+    LOGI("rootfs OK: %s", rootfsPath);
+
+    /* ---- Detect shell inside rootfs ---- */
+    char shellInGuest[256];
+    if (detect_shell(rootfsPath, shellInGuest, sizeof(shellInGuest)) != 0) {
+        goto fail;  /* set_error already called */
+    }
+    LOGI("shell in guest: %s", shellInGuest);
+
+    /* ---- Kill previous session ---- */
     if (g_childPid > 0) {
         LOGI("Killing previous child pid=%d", g_childPid);
         kill(g_childPid, SIGKILL);
@@ -92,37 +179,42 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
         g_childPid = -1;
     }
     if (g_masterFd >= 0) { close(g_masterFd); g_masterFd = -1; }
-    if (g_slaveFd  >= 0) { close(g_slaveFd);  g_slaveFd  = -1; }
 
+    /* ---- Open PTY ---- */
     struct winsize ws;
-    ws.ws_col = (unsigned short) cols;
-    ws.ws_row = (unsigned short) rows;
+    ws.ws_col   = (unsigned short) cols;
+    ws.ws_row   = (unsigned short) rows;
     ws.ws_xpixel = 0;
     ws.ws_ypixel = 0;
 
     int masterFd = -1, slaveFd = -1;
     if (openpty(&masterFd, &slaveFd, NULL, NULL, &ws) != 0) {
-        LOGE("openpty failed: %s", strerror(errno));
+        set_error("openpty() failed: %s (errno=%d)", strerror(errno), errno);
         goto fail;
     }
+    LOGI("openpty OK: master=%d slave=%d", masterFd, slaveFd);
 
-    // Make master non-blocking so Java reader can poll without blocking forever
+    /* Non-blocking master so reader thread can poll */
     int flags = fcntl(masterFd, F_GETFL, 0);
     fcntl(masterFd, F_SETFL, flags | O_NONBLOCK);
 
+    /* ---- Fork ---- */
     pid_t pid = fork();
     if (pid < 0) {
-        LOGE("fork failed: %s", strerror(errno));
-        close(masterFd); close(slaveFd);
+        set_error("fork() failed: %s (errno=%d)", strerror(errno), errno);
+        close(masterFd);
+        close(slaveFd);
         goto fail;
     }
 
     if (pid == 0) {
-        // ---- Child ----
+        /* ===================== CHILD ===================== */
         close(masterFd);
 
-        // Become session leader and attach slave as controlling terminal
-        setsid();
+        /* New session + controlling TTY */
+        if (setsid() < 0) {
+            LOGE("child setsid failed: %s", strerror(errno));
+        }
         ioctl(slaveFd, TIOCSCTTY, 0);
 
         dup2(slaveFd, STDIN_FILENO);
@@ -130,70 +222,74 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
         dup2(slaveFd, STDERR_FILENO);
         if (slaveFd > 2) close(slaveFd);
 
-        // Environment
+        /* Environment for the child (proot itself) */
         setenv("TERM", "xterm-256color", 1);
         setenv("HOME", "/root", 1);
         setenv("USER", "root", 1);
-        setenv("SHELL", "/bin/bash", 1);
+        setenv("SHELL", shellInGuest, 1);
         setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
-        setenv("ANDROID_FILES_DIR", filesDir, 1);
-        // Ensure proot can find linker etc. inside rootfs
-        // Also expose native lib dir if needed
-        // Build LD_LIBRARY_PATH if needed (usually not for proot static)
+        if (filesDir) setenv("ANDROID_FILES_DIR", filesDir, 1);
 
-        int useProot = file_exists(prootPath) && file_exists(rootfsPath);
-        if (useProot) {
-            // Check rootfs has /bin/bash or /bin/sh
-            char bashInRootfs[1024];
-            snprintf(bashInRootfs, sizeof(bashInRootfs), "%s/bin/bash", rootfsPath);
-            const char *shellInRootfs = "/bin/bash";
-            if (access(bashInRootfs, X_OK) != 0) {
-                shellInRootfs = "/bin/sh";
-            }
+        /* Build proot argument vector */
+        LOGI("child exec: %s -r %s -0 -b /dev -b /proc -b /sys "
+             "/usr/bin/env -i HOME=/root PATH=... TERM=... %s",
+             prootPath, rootfsPath, shellInGuest);
 
-            // Prepare bind mount for host filesDir and Download
-            // /sdcard/Download may not exist on all devices — proot will warn but continue
+        execl(prootPath, prootPath,
+              "-r", rootfsPath,
+              "-0",
+              "-b", "/dev",
+              "-b", "/proc",
+              "-b", "/sys",
+              /* Optional: host Download dir (proot warns if missing, continues) */
+              "-b", "/sdcard/Download:/mnt/download",
+              "-w", "/root",
+              /* Clean guest environment via /usr/bin/env -i */
+              "/usr/bin/env", "-i",
+              "HOME=/root",
+              "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+              "TERM=xterm-256color",
+              shellInGuest,
+              (char *) NULL);
 
-            LOGI("Child exec: proot -r %s ... %s", rootfsPath, shellInRootfs);
+        /* execl only returns on failure */
+        LOGE("execl(proot) failed: %s (errno=%d) — trying without env wrapper",
+             strerror(errno), errno);
 
-            execl(prootPath, prootPath,
-                  "-r", rootfsPath,
-                  "-0",
-                  "-b", "/dev",
-                  "-b", "/proc",
-                  "-b", "/sys",
-                  "-b", "/sdcard/Download:/mnt/download",
-                  // Bind host filesDir for debugging / file exchange
-                  // Use dynamic string
-                  "-w", "/root",
-                  shellInRootfs, "--login",
-                  (char *) NULL);
+        /* Retry without /usr/bin/env (in case rootfs lacks it) */
+        execl(prootPath, prootPath,
+              "-r", rootfsPath,
+              "-0",
+              "-b", "/dev",
+              "-b", "/proc",
+              "-b", "/sys",
+              "-b", "/sdcard/Download:/mnt/download",
+              "-w", "/root",
+              shellInGuest,
+              (char *) NULL);
+        LOGE("execl(proot) retry failed: %s", strerror(errno));
 
-            // If proot exec fails, log and try fallback
-            LOGE("execl proot failed: %s", strerror(errno));
-            // Fall through to bash fallback
-        }
-
-        // Fallback: run bash directly (without PRoot) — useful for testing
-        // or when rootfs is not yet fully set up
-        LOGI("Fallback exec: %s", bashPath);
-        if (file_exists(bashPath)) {
+        /* Fallback: run libbash.so directly (no proot — test builds) */
+        if (is_exec(bashPath)) {
+            LOGI("child fallback: exec %s --login", bashPath);
             execl(bashPath, "bash", "--login", (char *) NULL);
-            LOGE("execl bash failed: %s", strerror(errno));
+            LOGE("execl(bash) failed: %s", strerror(errno));
         }
-        // Last resort: /system/bin/sh
+
+        /* Last resort: Android system shell */
+        LOGI("child last resort: /system/bin/sh");
         execl("/system/bin/sh", "sh", (char *) NULL);
-        LOGE("All exec attempts failed: %s", strerror(errno));
+        LOGE("ALL exec attempts failed: %s", strerror(errno));
         _exit(127);
     }
 
-    // ---- Parent ----
+    /* ===================== PARENT ===================== */
     close(slaveFd);
     g_masterFd = masterFd;
-    g_slaveFd  = -1; // closed in parent
-    g_childPid = pid;
+    g_childPid  = pid;
 
-    LOGI("PTY started masterFd=%d childPid=%d", g_masterFd, g_childPid);
+    LOGI("PTY started: masterFd=%d childPid=%d", g_masterFd, g_childPid);
+    LOGI("=== nativePtyStart done (fd=%d) ===", g_masterFd);
 
     (*env)->ReleaseStringUTFChars(env, jProotPath, prootPath);
     (*env)->ReleaseStringUTFChars(env, jBashPath, bashPath);
@@ -204,6 +300,7 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
     return g_masterFd;
 
 fail:
+    LOGE("nativePtyStart FAILED: %s", g_lastError);
     (*env)->ReleaseStringUTFChars(env, jProotPath, prootPath);
     (*env)->ReleaseStringUTFChars(env, jBashPath, bashPath);
     (*env)->ReleaseStringUTFChars(env, jRootfsPath, rootfsPath);
@@ -212,9 +309,18 @@ fail:
     return -1;
 }
 
-// ---------------------------------------------------------------------------
-// JNI: nativePtyWrite
-// ---------------------------------------------------------------------------
+/* --------------------------------------------------------------------------
+ * JNI: nativePtyGetLastError — returns the last error string to Kotlin
+ * -------------------------------------------------------------------------- */
+
+JNIEXPORT jstring JNICALL
+Java_com_farou9_codeit_PtyBridge_nativePtyGetLastError(JNIEnv *env, jobject thiz) {
+    return (*env)->NewStringUTF(env, g_lastError);
+}
+
+/* --------------------------------------------------------------------------
+ * JNI: nativePtyWrite
+ * -------------------------------------------------------------------------- */
 
 JNIEXPORT jint JNICALL
 Java_com_farou9_codeit_PtyBridge_nativePtyWrite(JNIEnv *env, jobject thiz,
@@ -225,15 +331,15 @@ Java_com_farou9_codeit_PtyBridge_nativePtyWrite(JNIEnv *env, jobject thiz,
     (*env)->ReleaseByteArrayElements(env, data, bytes, JNI_ABORT);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        LOGE("pty write error: %s", strerror(errno));
+        LOGE("pty write error: %s (errno=%d)", strerror(errno), errno);
         return -1;
     }
     return (jint) n;
 }
 
-// ---------------------------------------------------------------------------
-// JNI: nativePtyRead — blocking with short timeout via select
-// ---------------------------------------------------------------------------
+/* --------------------------------------------------------------------------
+ * JNI: nativePtyRead — select() with 50ms timeout + child-exit check
+ * -------------------------------------------------------------------------- */
 
 JNIEXPORT jint JNICALL
 Java_com_farou9_codeit_PtyBridge_nativePtyRead(JNIEnv *env, jobject thiz,
@@ -243,31 +349,32 @@ Java_com_farou9_codeit_PtyBridge_nativePtyRead(JNIEnv *env, jobject thiz,
     jsize cap = (*env)->GetArrayLength(env, buffer);
     jbyte *buf = (*env)->GetByteArrayElements(env, buffer, NULL);
 
-    // Use select with 50ms timeout so we can check child exit periodically
     fd_set rfds;
     struct timeval tv;
     FD_ZERO(&rfds);
     FD_SET(g_masterFd, &rfds);
-    tv.tv_sec = 0;
-    tv.tv_usec = 50000; // 50ms
+    tv.tv_sec  = 0;
+    tv.tv_usec = 50000; /* 50ms */
 
     int sel = select(g_masterFd + 1, &rfds, NULL, NULL, &tv);
     if (sel < 0) {
         (*env)->ReleaseByteArrayElements(env, buffer, buf, JNI_ABORT);
         if (errno == EINTR) return 0;
-        LOGE("select error: %s", strerror(errno));
+        LOGE("select error: %s (errno=%d)", strerror(errno), errno);
         return -1;
     }
     if (sel == 0) {
-        // Timeout — check if child exited
+        /* Timeout — poll child exit */
         if (g_childPid > 0) {
             int status;
             pid_t r = waitpid(g_childPid, &status, WNOHANG);
             if (r == g_childPid) {
-                LOGI("Child exited status=%d", status);
+                int code = WIFEXITED(status) ? WEXITSTATUS(status)
+                          : WIFSIGNALED(status) ? -WTERMSIG(status) : status;
+                LOGI("child exited: raw=%d code=%d", status, code);
                 g_childPid = -1;
                 (*env)->ReleaseByteArrayElements(env, buffer, buf, JNI_ABORT);
-                return -1; // EOF signal to Kotlin
+                return -1; /* EOF → Kotlin */
             }
         }
         (*env)->ReleaseByteArrayElements(env, buffer, buf, JNI_ABORT);
@@ -281,17 +388,15 @@ Java_com_farou9_codeit_PtyBridge_nativePtyRead(JNIEnv *env, jobject thiz,
             return 0;
         }
         if (errno == EIO) {
-            // EIO often means child closed slave side
-            LOGI("PTY read EIO — child likely exited");
+            LOGI("PTY read EIO — child closed slave side");
             (*env)->ReleaseByteArrayElements(env, buffer, buf, JNI_ABORT);
             return -1;
         }
-        LOGE("PTY read error: %s", strerror(errno));
+        LOGE("PTY read error: %s (errno=%d)", strerror(errno), errno);
         (*env)->ReleaseByteArrayElements(env, buffer, buf, JNI_ABORT);
         return -1;
     }
     if (n == 0) {
-        // EOF — check child
         if (g_childPid > 0) {
             int status;
             waitpid(g_childPid, &status, WNOHANG);
@@ -301,35 +406,33 @@ Java_com_farou9_codeit_PtyBridge_nativePtyRead(JNIEnv *env, jobject thiz,
         return -1;
     }
 
-    (*env)->ReleaseByteArrayElements(env, buffer, buf, 0); // copy back
+    (*env)->ReleaseByteArrayElements(env, buffer, buf, 0);
     return (jint) n;
 }
 
-// ---------------------------------------------------------------------------
-// JNI: nativePtyResize
-// ---------------------------------------------------------------------------
+/* --------------------------------------------------------------------------
+ * JNI: nativePtyResize — TIOCSWINSZ + SIGWINCH to child
+ * -------------------------------------------------------------------------- */
 
 JNIEXPORT jint JNICALL
 Java_com_farou9_codeit_PtyBridge_nativePtyResize(JNIEnv *env, jobject thiz,
                                                  jint cols, jint rows) {
     if (g_masterFd < 0) return -1;
     set_winsize(g_masterFd, cols, rows);
-    // Forward SIGWINCH to child so bash/readline redraws
     if (g_childPid > 0) kill(g_childPid, SIGWINCH);
     LOGD("resize cols=%d rows=%d pid=%d", cols, rows, g_childPid);
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// JNI: nativePtyKill
-// ---------------------------------------------------------------------------
+/* --------------------------------------------------------------------------
+ * JNI: nativePtyKill
+ * -------------------------------------------------------------------------- */
 
 JNIEXPORT void JNICALL
 Java_com_farou9_codeit_PtyBridge_nativePtyKill(JNIEnv *env, jobject thiz) {
     LOGI("nativePtyKill masterFd=%d pid=%d", g_masterFd, g_childPid);
     if (g_childPid > 0) {
         kill(g_childPid, SIGTERM);
-        // Give it a moment, then SIGKILL
         usleep(200000);
         kill(g_childPid, SIGKILL);
         int status;
@@ -340,15 +443,11 @@ Java_com_farou9_codeit_PtyBridge_nativePtyKill(JNIEnv *env, jobject thiz) {
         close(g_masterFd);
         g_masterFd = -1;
     }
-    if (g_slaveFd >= 0) {
-        close(g_slaveFd);
-        g_slaveFd = -1;
-    }
 }
 
-// ---------------------------------------------------------------------------
-// JNI: nativePtyGetFd
-// ---------------------------------------------------------------------------
+/* --------------------------------------------------------------------------
+ * JNI: nativePtyGetFd
+ * -------------------------------------------------------------------------- */
 
 JNIEXPORT jint JNICALL
 Java_com_farou9_codeit_PtyBridge_nativePtyGetFd(JNIEnv *env, jobject thiz) {
