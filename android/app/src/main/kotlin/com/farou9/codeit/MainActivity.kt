@@ -73,6 +73,30 @@ class MainActivity : FlutterActivity() {
                         result.success(filesDir.absolutePath)
                     }
 
+                    "resolveBinary" -> {
+                        // Resolve libproot.so / libbash.so / libtar.so with
+                        // nativeLibraryDir → assets fallback (see PtyBridge).
+                        try {
+                            val name = call.arguments as String
+                            val path = ptyBridge?.resolveBinary(
+                                name = name,
+                                nativeLibDir = applicationInfo.nativeLibraryDir,
+                                filesDir = filesDir.absolutePath,
+                            )
+                            if (path != null) {
+                                result.success(path)
+                            } else {
+                                result.error(
+                                    "BINARY_NOT_FOUND",
+                                    "$name not found in nativeLibraryDir or assets/bin",
+                                    null,
+                                )
+                            }
+                        } catch (e: Exception) {
+                            result.error("RESOLVE_FAILED", e.message, null)
+                        }
+                    }
+
                     "startPty" -> {
                         try {
                             @Suppress("UNCHECKED_CAST")

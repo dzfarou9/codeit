@@ -37,8 +37,23 @@ android {
         jvmTarget = '17'
     }
 
+    // Build libpty.so from src/main/jni/pty_bridge.c via CMake.
+    // Output: build/intermediates/... -> packaged into APK lib/arm64-v8a/libpty.so
+    externalNativeBuild {
+        cmake {
+            path file("src/main/jni/CMakeLists.txt")
+            version "3.22.1"
+        }
+    }
+
     sourceSets {
-        main.java.srcDirs += 'src/main/kotlin'
+        main {
+            java.srcDirs += 'src/main/kotlin'
+
+            // Prebuilt executables (libproot.so, libbash.so, libtar.so) live here.
+            // AGP packages every *.so under this tree into the APK's lib/<abi>/.
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
     }
 
     defaultConfig {
@@ -47,9 +62,18 @@ android {
         targetSdk 36
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
+
         ndk {
             // Only 64-bit is supported: W^X enforcement; 32-bit deprecated on modern devices
             abiFilters 'arm64-v8a'
+        }
+
+        externalNativeBuild {
+            cmake {
+                cFlags "-D_GNU_SOURCE -O2 -fPIC -Wall"
+                arguments "-DANDROID_PLATFORM=android-24"
+                targets "pty"
+            }
         }
     }
 
@@ -60,25 +84,22 @@ android {
             shrinkResources false
         }
         debug {
-            // Keep native libs uncompressed so OS can extract to nativeLibraryDir
-            packagingOptions {
-                jniLibs {
-                    useLegacyPackaging = false
-                }
-            }
+            minifyEnabled false
         }
     }
 
-    // Ensure .so in jniLibs are kept uncompressed in APK (required for nativeLibraryDir exec)
-    packagingOptions {
+    // extractNativeLibs=true (also set in AndroidManifest) forces the OS to
+    // extract every packaged .so to nativeLibraryDir as a real file — required
+    // so we can exec() libproot.so / libbash.so / libtar.so.
+    //
+    // useLegacyPackaging=true  →  .so stored compressed in APK, extracted on install.
+    // AGP maps this to android:extractNativeLibs=true during manifest merge,
+    // overriding any conflicting default.
+    packaging {
         jniLibs {
-            useLegacyPackaging = false
+            useLegacyPackaging = true
         }
     }
-
-    // Required: native libs must remain uncompressed
-    // AGP 8+ does this by default for .so, but we are explicit.
-    // extractNativeLibs=true in manifest ensures extraction to nativeLibraryDir.
 }
 
 flutter {

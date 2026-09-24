@@ -18,6 +18,13 @@
     <!-- Notifications for foreground service -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!--
+      extractNativeLibs=true → PackageManager extracts every lib/<abi>/*.so
+      from the APK into applicationInfo.nativeLibraryDir as a real file.
+      Required so we can exec() libproot.so / libbash.so / libtar.so (W^X
+      only allows execution from nativeLibraryDir). AGP also forces this
+      true via packagingOptions.jniLibs.useLegacyPackaging=true in build.gradle.
+    -->
     <application
         android:label="codeit"
         android:name="${applicationName}"

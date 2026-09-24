@@ -10,15 +10,17 @@ import kotlin.concurrent.thread
 /**
  * PtyBridge — Kotlin wrapper around the JNI PTY native layer.
  *
- * Binaries are resolved from nativeLibraryDir (W^X compliant).
- * The PTY is managed in native code (pty_bridge.c -> libpty.so).
+ * Binary resolution order (W^X first, assets fallback second):
+ *  1. applicationInfo.nativeLibraryDir/<name>   (extracted from APK jniLibs)
+ *  2. filesDir/bin/<name>                       (already copied earlier)
+ *  3. Copy from Flutter assets flutter_assets/bin/<name> → filesDir/bin/<name>
+ *
+ * The PTY is managed in native code (pty_bridge.c -> libpty.so, built via CMake).
  *
  * Flow:
  *  Dart --MethodChannel--> PtyBridge.start() --> nativePtyStart()
  *  native thread reads from PTY master fd --> callback --> EventChannel --> xterm.dart
  *  Dart writes --> PtyBridge.write() --> nativePtyWrite()
- *
- * NOTE: Never execute binaries from filesDir. All exec paths point to nativeLibraryDir.
  */
 class PtyBridge(private val context: Context) {
 
@@ -28,7 +30,7 @@ class PtyBridge(private val context: Context) {
             try {
                 System.loadLibrary("pty")
             } catch (e: UnsatisfiedLinkError) {
-                Log.e(TAG, "Failed to load libpty.so — ensure it is in jniLibs/arm64-v8a", e)
+                Log.e(TAG, "Failed to load libpty.so — ensure externalNativeBuild/CMake is wired in build.gradle", e)
             }
         }
     }
@@ -62,14 +64,76 @@ class PtyBridge(private val context: Context) {
     private external fun nativePtyGetLastError(): String
 
     /**
+     * Resolve [name] (e.g. "libproot.so") to an executable absolute path.
+     *
+     * Order:
+     *  1. nativeLibraryDir/name  (preferred — W^X compliant)
+     *  2. filesDir/bin/name      (already-copied fallback)
+     *  3. assets flutter_assets/bin/name → copy to filesDir/bin/name
+     *
+     * Returns null if the binary cannot be found or made executable.
+     */
+    fun resolveBinary(name: String, nativeLibDir: String, filesDir: String): String? {
+        // ---- 1. Primary: nativeLibraryDir ----
+        val primary = File(nativeLibDir, name)
+        if (primary.exists()) {
+            if (!primary.canExecute()) {
+                Log.w(TAG, "$name not +x at $primary — setExecutable(true)")
+                primary.setExecutable(true, false)
+            }
+            if (primary.canExecute()) {
+                Log.i(TAG, "$name resolved (nativeLibraryDir): $primary")
+                return primary.absolutePath
+            }
+            Log.w(TAG, "$name exists at $primary but setExecutable failed — trying fallback")
+        } else {
+            val listing = File(nativeLibDir).listFiles()
+                ?.joinToString { f -> f.name } ?: "(empty or unreadable)"
+            Log.w(TAG, "$name missing in nativeLibraryDir ($nativeLibDir). Contents: $listing")
+        }
+
+        // ---- 2. Already-copied fallback in filesDir/bin ----
+        val fallbackDir = File(filesDir, "bin")
+        if (!fallbackDir.exists()) fallbackDir.mkdirs()
+        val fallback = File(fallbackDir, name)
+        if (fallback.exists()) {
+            if (!fallback.canExecute()) fallback.setExecutable(true, false)
+            if (fallback.canExecute()) {
+                Log.i(TAG, "$name resolved (filesDir/bin): $fallback")
+                return fallback.absolutePath
+            }
+        }
+
+        // ---- 3. Copy from Flutter assets → filesDir/bin ----
+        // Flutter packages pubspec assets under "flutter_assets/" inside the APK.
+        val assetPath = "flutter_assets/bin/$name"
+        try {
+            context.assets.open(assetPath).use { input ->
+                fallback.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            fallback.setExecutable(true, false)
+            if (fallback.canExecute()) {
+                Log.i(TAG, "$name copied from assets ($assetPath) → $fallback")
+                return fallback.absolutePath
+            }
+            Log.e(TAG, "$name copied to $fallback but setExecutable(true) failed")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to copy $name from assets ($assetPath): $e")
+        }
+
+        return null
+    }
+
+    /**
      * Start the PRoot session.
      *
-     * Resolves binary paths from nativeLibraryDir (W^X compliant).
-     * Constructs the proot invocation:
+     * Resolves libproot.so / libbash.so via [resolveBinary] (nativeLibraryDir
+     * first, Flutter assets → filesDir/bin fallback). Constructs the proot
+     * invocation in native code:
      *   libproot.so -r <rootfs> -0 -b /dev -b /proc -b /sys
-     *               -b /sdcard/Download:/mnt/download
-     *               -b <filesDir>:/host
-     *               -w /root /bin/bash --login
+     *               /usr/bin/env -i HOME=… PATH=… TERM=… <shell>
      */
     fun start(
         cols: Int,
@@ -84,31 +148,21 @@ class PtyBridge(private val context: Context) {
             Thread.sleep(300)
         }
 
-        val prootPath = "$nativeLibDir/libproot.so"
-        val bashPath = "$nativeLibDir/libbash.so"
-        // libtar.so is used separately during setup extraction (not here)
-
         lastError = ""
 
-        // ---- Verify libproot.so ----
-        val prootFile = File(prootPath)
-        if (!prootFile.exists()) {
-            val listing = File(nativeLibDir).listFiles()
-                ?.joinToString { f -> f.name } ?: "(empty or unreadable)"
-            lastError = "libproot.so missing at $prootPath | nativeLibraryDir contents: $listing"
+        // ---- Resolve binaries (nativeLibraryDir → assets fallback) ----
+        val prootPath = resolveBinary("libproot.so", nativeLibDir, filesDir)
+        if (prootPath == null) {
+            lastError = "libproot.so not found — missing from nativeLibraryDir AND assets/bin. " +
+                "Place it in android/app/src/main/jniLibs/arm64-v8a/ or assets/bin/."
             Log.e(TAG, lastError)
             return false
         }
-        if (!prootFile.canExecute()) {
-            Log.w(TAG, "libproot.so not +x at $prootPath — attempting setExecutable(true)")
-            prootFile.setExecutable(true)
-            if (!prootFile.canExecute()) {
-                lastError = "libproot.so not executable at $prootPath (setExecutable failed)"
-                Log.e(TAG, lastError)
-                return false
-            }
-        }
-        Log.i(TAG, "libproot.so OK: $prootPath (canExecute=true)")
+
+        // libbash.so is optional — C code falls back to /bin/sh, /bin/busybox, /system/bin/sh
+        val bashPath = resolveBinary("libbash.so", nativeLibDir, filesDir)
+            ?: "$nativeLibDir/libbash.so"
+        Log.i(TAG, "binaries: proot=$prootPath bash=$bashPath")
 
         // ---- Verify rootfs ----
         val rootfsFile = File(rootfsPath)
@@ -157,9 +211,6 @@ class PtyBridge(private val context: Context) {
     private fun startReaderLoop() {
         readerThread = thread(name = "pty-reader", isDaemon = true) {
             val buf = ByteArray(8192)
-            // We poll via native read; the JNI layer exposes a blocking read helper.
-            // For simplicity we call nativePtyReadAvailable if present, else busy poll.
-            // Here we delegate to a helper that reads from the PTY fd set in native code.
             while (running.get()) {
                 try {
                     val n = nativePtyRead(buf)

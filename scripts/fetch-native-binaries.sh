@@ -1,51 +1,49 @@
 #!/usr/bin/env bash
-# fetch-native-binaries.sh — Populate jniLibs/arm64-v8a for codeit
-# Requires: curl, unzip, file
+# fetch-native-binaries.sh — Populate jniLibs/arm64-v8a (primary) and
+# assets/bin (fallback copy source) for codeit.
+# Requires: curl, file
 # Run from repo root: bash scripts/fetch-native-binaries.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="$ROOT/android/app/src/main/jniLibs/arm64-v8a"
-mkdir -p "$DEST"
+JNILIBS="$ROOT/android/app/src/main/jniLibs/arm64-v8a"
+ASSETS="$ROOT/assets/bin"
+mkdir -p "$JNILIBS" "$ASSETS"
 
-echo "[fetch] Destination: $DEST"
+fetch_one() {
+  local url="$1" dest_jni="$2" dest_asset="$3" label="$4"
+  if [ -z "$url" ]; then
+    echo "[fetch] SKIP $label — set its *_URL env var"
+    return 0
+  fi
+  echo "[fetch] $label from $url"
+  curl -fL --retry 3 -o "$dest_jni" "$url"
+  chmod +x "$dest_jni"
+  cp -f "$dest_jni" "$dest_asset"
+  chmod +x "$dest_asset"
+  file "$dest_jni" || true
+}
 
-# --- proot (from termux/proot releases, if available as static aarch64) ---
-# NOTE: Termux proot releases are typically not prebuilt as standalone static
-# binaries. You may need to cross-compile:
-#   git clone https://github.com/termux/proot
-#   make -C src loader.built seccomp.built  # with aarch64-linux-android toolchain
-# For now we attempt to fetch a known static build if the URL is configured.
+echo "[fetch] jniLibs → $JNILIBS"
+echo "[fetch] assets  → $ASSETS"
 
-if [ -n "${PROOT_URL:-}" ]; then
-  echo "[fetch] proot from \$PROOT_URL"
-  curl -L -o "$DEST/libproot.so" "$PROOT_URL"
-  chmod +x "$DEST/libproot.so"
-  file "$DEST/libproot.so" || true
-else
-  echo "[fetch] SKIP proot — set PROOT_URL to fetch, or cross-compile manually."
-  echo "       See android/app/src/main/jniLibs/arm64-v8a/README.md"
-fi
+# proot (static aarch64-linux-android)
+fetch_one "${PROOT_URL:-}" \
+  "$JNILIBS/libproot.so" "$ASSETS/libproot.so" "proot"
 
-# --- busybox as bash fallback (static aarch64) ---
-if [ -n "${BUSYBOX_URL:-}" ]; then
-  echo "[fetch] busybox from \$BUSYBOX_URL"
-  curl -L -o "$DEST/libbash.so" "$BUSYBOX_URL"
-  chmod +x "$DEST/libbash.so"
-else
-  echo "[fetch] SKIP busybox/bash — set BUSYBOX_URL"
-fi
+# busybox / bash fallback
+fetch_one "${BUSYBOX_URL:-}" \
+  "$JNILIBS/libbash.so" "$ASSETS/libbash.so" "busybox/bash"
 
-# --- bsdtar (libarchive) ---
-if [ -n "${BSDTAR_URL:-}" ]; then
-  echo "[fetch] bsdtar from \$BSDTAR_URL"
-  curl -L -o "$DEST/libtar.so" "$BSDTAR_URL"
-  chmod +x "$DEST/libtar.so"
-else
-  echo "[fetch] SKIP bsdtar — set BSDTAR_URL"
-fi
+# bsdtar (libarchive)
+fetch_one "${BSDTAR_URL:-}" \
+  "$JNILIBS/libtar.so" "$ASSETS/libtar.so" "bsdtar"
 
-echo "[fetch] Done. Contents:"
-ls -lh "$DEST/"
 echo ""
-echo "Build libpty.so via:  cd android && ./gradlew :app:assembleDebug"
+echo "[fetch] jniLibs contents:"
+ls -lh "$JNILIBS/"
+echo "[fetch] assets/bin contents:"
+ls -lh "$ASSETS/"
+echo ""
+echo "libpty.so is built automatically by CMake via externalNativeBuild."
+echo "No manual step needed — cd android && ./gradlew :app:assembleDebug"

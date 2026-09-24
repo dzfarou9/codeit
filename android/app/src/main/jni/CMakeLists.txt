@@ -11,10 +11,10 @@ target_link_libraries(pty
     ${log-lib}
 )
 
-# Required for openpty()
-target_link_options(pty PRIVATE -Wl,--no-undefined)
+# openpty()/forkpty() live in bionic libc on Android — no -lutil needed.
+# Do NOT use -Wl,--no-undefined here: it can fail the build if any optional
+# symbol (e.g. termios extensions) is weakly resolved by the NDK stub.
 
-# Compiler flags
 target_compile_options(pty PRIVATE
     -Wall
     -Wextra
@@ -22,3 +22,6 @@ target_compile_options(pty PRIVATE
     -fPIC
     -D_GNU_SOURCE
 )
+
+# Ensure the output is named libpty.so (matches System.loadLibrary("pty"))
+set_target_properties(pty PROPERTIES OUTPUT_NAME "pty")

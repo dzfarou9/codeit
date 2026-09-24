@@ -247,7 +247,8 @@ class RootfsInstaller {
 
   Future<bool> _extractViaNativeTar(String archive, String dest) async {
     try {
-      final tarBin = PRootEngine.instance.tarPath;
+      // resolveBinary: nativeLibraryDir first, then assets → filesDir/bin fallback
+      final tarBin = await PRootEngine.instance.resolveBinary('libtar.so');
       final tarFile = File(tarBin);
       if (!await tarFile.exists()) {
         debugPrint('[RootfsInstaller] libtar.so not found at $tarBin — skipping native extract');

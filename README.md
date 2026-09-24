@@ -6,16 +6,18 @@ Standalone Android Linux IDE. Embeds a PRoot Linux environment (Ubuntu / Alpine 
 `com.farou9.codeit` · `targetSdk 34` · `minSdk 24` · `arm64-v8a` only
 
 ## W^X Compliance (Android 10+)
-All native executables live in `android/app/src/main/jniLibs/arm64-v8a/` as `lib*.so` so the OS extracts them to `nativeLibraryDir` (the only executable location). Never execute from `filesDir`.
+All native executables live in `android/app/src/main/jniLibs/arm64-v8a/` as `lib*.so` so the OS extracts them to `nativeLibraryDir` (the only executable location). `libpty.so` is built by CMake via `externalNativeBuild` — do not place it manually.
 
 | Binary | jniLibs path | Runtime |
 |---|---|---|
 | proot | `libproot.so` | `<nativeLibraryDir>/libproot.so` |
 | bash / busybox | `libbash.so` | `<nativeLibraryDir>/libbash.so` |
 | bsdtar | `libtar.so` | `<nativeLibraryDir>/libtar.so` |
-| JNI bridge | `libpty.so` | `<nativeLibraryDir>/libpty.so` (built from `pty_bridge.c`) |
+| JNI bridge | *(built by CMake)* | `<nativeLibraryDir>/libpty.so` |
 
-`PtyBridge.kt` resolves paths via `applicationInfo.nativeLibraryDir`.
+**Fallback:** if a binary is missing from `nativeLibraryDir`, `PtyBridge.resolveBinary()` copies it from Flutter assets `assets/bin/<name>` → `filesDir/bin/<name>` and `setExecutable(true)`. On Android 10+ W^X may still block exec from `filesDir` — keep jniLibs populated as the primary path.
+
+`PtyBridge.kt` resolves paths via `applicationInfo.nativeLibraryDir`, then the assets fallback.
 
 ## Project Structure
 
@@ -30,9 +32,8 @@ codeit/
 │   │   │   └── PtyService.kt            # Foreground Service (Phantom Killer guard)
 │   │   ├── jni/
 │   │   │   ├── pty_bridge.c             # openpty + fork + proot exec
-│   │   │   ├── CMakeLists.txt
-│   │   │   ├── Android.mk / Application.mk
-│   │   └── jniLibs/arm64-v8a/           # libproot.so, libbash.so, libtar.so, libpty.so
+│   │   │   └── CMakeLists.txt           # wired via externalNativeBuild → libpty.so
+│   │   └── jniLibs/arm64-v8a/           # libproot.so, libbash.so, libtar.so (libpty built by CMake)
 │   └── build.gradle / settings.gradle
 ├── lib/
 │   ├── main.dart                        # RootRouter (Setup vs Terminal)
@@ -45,7 +46,7 @@ codeit/
 │   │   └── terminal_screen.dart
 │   ├── widgets/extra_keys_row.dart
 │   └── utils/constants.dart
-├── assets/rootfs/                       # Optional bundled rootfs (empty by default)
+├── assets/bin/                          # Fallback copies of libproot.so etc. (PtyBridge.resolveBinary)
 └── pubspec.yaml
 ```
 
@@ -59,20 +60,25 @@ codeit/
 This repo ships `jniLibs/arm64-v8a/README.md` as a placeholder. Before building, populate:
 
 ```bash
-# Example: fetch static aarch64 proot + busybox + bsdtar
-./scripts/fetch-native-binaries.sh   # (create this script per README)
+# Option A: fetch script (also mirrors into assets/bin/ fallback)
+PROOT_URL=... BUSYBOX_URL=... BSDTAR_URL=... ./scripts/fetch-native-binaries.sh
 
-# Or manually:
-# 1. Build proot for aarch64-linux-android (static)
-# 2. Copy to android/app/src/main/jniLibs/arm64-v8a/libproot.so
-# 3. Repeat for bash/busybox -> libbash.so, bsdtar -> libtar.so
-# 4. Build libpty.so: cd android && ./gradlew :app:assembleDebug  (CMake builds it)
+# Option B: manually copy static aarch64 binaries:
+#   proot     → android/app/src/main/jniLibs/arm64-v8a/libproot.so
+#   bash/busybox → android/app/src/main/jniLibs/arm64-v8a/libbash.so
+#   bsdtar    → android/app/src/main/jniLibs/arm64-v8a/libtar.so
+#   (optional fallback) same three files → assets/bin/
+#
+# libpty.so is built automatically by CMake — no manual step.
 ```
 
-Verify `.so` are uncompressed in the APK:
+Also copy the same three binaries into `assets/bin/` if you want the Kotlin
+assets→`filesDir/bin` fallback to work.
+
+Verify `.so` are packaged in the APK:
 ```bash
-unzip -lv build/app/outputs/flutter-apk/app-release.apk | grep 'lib/.*\.so'
-# method should be "Stored" (0)
+unzip -lv build/app/outputs/flutter-apk/app-release.apk | grep 'lib/arm64-v8a/.*\.so'
+# Should list libproot.so, libbash.so, libtar.so, libpty.so, libflutter.so, libapp.so
 ```
 
 ## Initialization

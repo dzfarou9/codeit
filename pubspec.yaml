@@ -29,3 +29,8 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    # Fallback copies of libproot.so / libbash.so / libtar.so —
+    # used by PtyBridge.resolveBinary() when nativeLibraryDir misses them.
+    # Packaged as assets/flutter_assets/bin/*.so inside the APK.
+    - assets/bin/

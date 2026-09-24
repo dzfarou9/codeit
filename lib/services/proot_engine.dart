@@ -41,10 +41,27 @@ class PRootEngine {
   String get rootfsPath =>
       _filesDir != null ? '$_filesDir/rootfs' : '';
 
-  /// Convenience: path to proot binary in nativeLibraryDir
+  /// Fallback path only — prefer [resolveBinary] for the real executable path
+  /// (nativeLibraryDir first, assets → filesDir/bin second).
   String get prootPath => '$_nativeLibDir/libproot.so';
   String get bashPath => '$_nativeLibDir/libbash.so';
   String get tarPath => '$_nativeLibDir/libtar.so';
+
+  /// Resolve an executable (e.g. 'libproot.so', 'libtar.so') to an absolute path.
+  ///
+  /// Native side tries nativeLibraryDir first (W^X compliant), then copies
+  /// from Flutter assets `assets/bin/<name>` → `filesDir/bin/<name>` if missing.
+  Future<String> resolveBinary(String name) async {
+    if (_nativeLibDir == null || _filesDir == null) await init();
+    try {
+      final path = await _method.invokeMethod<String>('resolveBinary', name);
+      if (path != null && path.isNotEmpty) return path;
+    } catch (e) {
+      debugPrint('[PRootEngine] resolveBinary($name) error: $e');
+    }
+    // Last-ditch sync fallback (no assets copy — just nativeLibraryDir)
+    return '$_nativeLibDir/$name';
+  }
 
   // ---------------------------------------------------------------------------
   // Init — call once at app startup
