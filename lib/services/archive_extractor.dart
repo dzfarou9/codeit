@@ -2,14 +2,18 @@ import 'dart:io';
 import 'package:archive/archive.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
+import 'native_fs.dart';
 
-/// ArchiveExtractor — pure-Dart rootfs extraction fallback used when the
-/// native `libtar.so` binary is unavailable.
+/// ArchiveExtractor — rootfs extraction used when the native `libtar.so`
+/// binary is unavailable (or as a forced retry path).
 ///
 /// Handles `.tar.gz`, `.tar.xz`, `.tar.bz2`, `.tar`, and `.zip` archives.
-/// Symbolic links are recreated via `dart:io` `Link` with parent-directory
-/// creation and existing-path cleanup to avoid `Permission Denied` /
-/// `FileSystemException` inside `filesDir`.
+///
+/// POSIX symlinks and executable bits are applied via [NativeFs] (real
+/// `symlink()` / `chmod()` syscalls through JNI) so UsrMerge layouts
+/// (`/bin` → `/usr/bin`, `/bin/sh` → `dash`/`busybox`) survive extraction
+/// on Android. dart:io `Link` is only a fallback when the native bridge
+/// is unavailable.
 ///
 /// Every per-entry failure is caught and logged with the exact file path so
 /// a single bad symlink never aborts the whole extraction.
@@ -105,9 +109,9 @@ class ArchiveExtractor {
             skipped++;
             continue;
           }
-          // Absolute symlink targets (e.g. "/bin/busybox") are normal inside a
-          // rootfs — they are guest paths resolved by proot, NOT host paths.
-          // Preserve them as-is. Relative targets must stay under destDir.
+          // Absolute symlink targets (e.g. "/bin/busybox", "/usr/bin/dash")
+          // are guest paths resolved by proot — preserve as-is.
+          // Relative targets must stay under destDir (zip-slip).
           if (!p.isAbsolute(target)) {
             final linkParent = p.dirname(entryPath);
             final resolvedTarget = p.normalize(p.join(linkParent, target));
@@ -120,15 +124,26 @@ class ArchiveExtractor {
             }
           }
 
-          // Ensure parent directory exists
           await Directory(p.dirname(entryPath)).create(recursive: true);
-
-          // Remove any existing file/link/dir at this path to avoid
-          // "File exists" / "Permission Denied"
           await _removeIfExists(entryPath);
 
-          await Link(entryPath).create(target, recursive: false);
-          ok++;
+          // Prefer native symlink(2) via JNI — dart:io Link is unreliable
+          // for absolute targets / UsrMerge on some Android versions.
+          final nativeOk = await NativeFs.symlink(target, entryPath);
+          if (nativeOk) {
+            ok++;
+            continue;
+          }
+          // Fallback: dart:io Link (relative targets only — absolute may fail)
+          try {
+            await Link(entryPath).create(target, recursive: false);
+            ok++;
+          } catch (e) {
+            failed++;
+            debugPrint(
+                '[ArchiveExtractor] symlink FAILED for "${entry.name}" '
+                '-> $target ($entryPath): $e');
+          }
           continue;
         }
 
@@ -147,16 +162,19 @@ class ArchiveExtractor {
         final bytesOut = entry.content as List<int>;
         await out.writeAsBytes(bytesOut, flush: false);
 
-        // Restore POSIX permissions (best effort — chmod may not exist)
+        // Restore POSIX permissions via native chmod(2) — Process.run('chmod')
+        // often fails on Android (no chmod binary / W^X).
         if (entry.mode != 0) {
-          try {
-            final oct = (entry.mode & 0x1FF).toRadixString(8).padLeft(3, '0');
-            final result = await Process.run('chmod', [oct, entryPath]);
-            if (result.exitCode != 0) {
-              // Non-fatal — Android often lacks chmod for app-private paths
-            }
-          } catch (_) {
-            // chmod unavailable — ignore, PRoot will handle at runtime
+          final posixMode = entry.mode & 0x1FF;
+          final nativeChmodOk = await NativeFs.chmod(entryPath, posixMode);
+          if (!nativeChmodOk) {
+            // Best-effort dart fallback
+            try {
+              await Process.run('chmod', [
+                posixMode.toRadixString(8).padLeft(3, '0'),
+                entryPath,
+              ]);
+            } catch (_) {}
           }
         }
 

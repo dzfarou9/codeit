@@ -65,6 +65,94 @@ class PtyBridge(private val context: Context) {
     private external fun nativePtyGetFd(): Int
     private external fun nativePtyGetLastError(): String
 
+    // ---- Native FS helpers (real symlink()/chmod() syscalls — NDK) ----
+    // Used by rootfs extraction for POSIX symlinks + executable bits.
+    external fun nativeSymlink(target: String, path: String): Int
+    external fun nativeChmod(path: String, mode: Int): Int
+    external fun nativeReadlink(path: String): String?
+    external fun nativeIsSymlink(path: String): Boolean
+    external fun nativeExists(path: String): Boolean
+    external fun nativeChmodTree(path: String, mode: Int): Int
+
+    /**
+     * Create a POSIX symlink via native symlink(2).
+     * Returns true on success (or if the link already points at [target]).
+     */
+    fun symlink(target: String, path: String): Boolean {
+        val rc = try {
+            nativeSymlink(target, path)
+        } catch (e: UnsatisfiedLinkError) {
+            Log.w(TAG, "nativeSymlink unavailable — falling back to java.nio: $e")
+            return _javaSymlink(target, path)
+        }
+        if (rc == 0) return true
+        // EEXIST (-17 on bionic/linux) — check if existing link already correct
+        if (rc == -17) {
+            val existing = try { nativeReadlink(path) } catch (_: Throwable) { null }
+            if (existing == target) return true
+            // Replace wrong/stale link
+            _deletePath(path)
+            val rc2 = try { nativeSymlink(target, path) } catch (_: Throwable) { -1 }
+            return rc2 == 0
+        }
+        Log.w(TAG, "nativeSymlink($target -> $path) rc=$rc — trying java fallback")
+        return _javaSymlink(target, path)
+    }
+
+    /** chmod via native chmod(2). mode is POSIX (e.g. 0755 = 493). */
+    fun chmod(path: String, mode: Int): Boolean {
+        return try {
+            nativeChmod(path, mode) == 0
+        } catch (e: UnsatisfiedLinkError) {
+            Log.w(TAG, "nativeChmod unavailable: $e")
+            false
+        }
+    }
+
+    /** Recursively chmod a tree (does not follow symlinked subtrees). */
+    fun chmodTree(path: String, mode: Int): Int {
+        return try {
+            nativeChmodTree(path, mode)
+        } catch (e: UnsatisfiedLinkError) {
+            Log.w(TAG, "nativeChmodTree unavailable: $e")
+            -1
+        }
+    }
+
+    fun readlink(path: String): String? {
+        return try { nativeReadlink(path) } catch (_: Throwable) { null }
+    }
+
+    fun isSymlink(path: String): Boolean {
+        return try { nativeIsSymlink(path) } catch (_: Throwable) { false }
+    }
+
+    fun exists(path: String): Boolean {
+        return try { nativeExists(path) } catch (_: Throwable) { File(path).exists() }
+    }
+
+    private fun _javaSymlink(target: String, path: String): Boolean {
+        return try {
+            _deletePath(path)
+            java.nio.file.Files.createSymbolicLink(
+                java.nio.file.Paths.get(path),
+                java.nio.file.Paths.get(target),
+            )
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "java symlink failed for $path -> $target: $e")
+            false
+        }
+    }
+
+    private fun _deletePath(path: String) {
+        try {
+            val f = File(path)
+            if (f.isDirectory && !f.isFile) f.deleteRecursively() else f.delete()
+        } catch (_: Exception) {}
+        try { java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(path)) } catch (_: Exception) {}
+    }
+
     /**
      * Resolve [name] (e.g. "libproot.so") to an executable absolute path.
      *
@@ -166,34 +254,53 @@ class PtyBridge(private val context: Context) {
         }
         Log.i(TAG, "PROOT_TMP_DIR=${tmpDir.absolutePath}")
 
-        // ---- Verify rootfs extraction BEFORE proot ----
-        // File.exists() follows symlinks: a dangling /bin/sh → false.
+        // ---- Verify ANY shell exists under rootfs BEFORE proot ----
+        // UsrMerge: /bin may be a symlink to /usr/bin — File.exists follows it.
+        // Accept any of: sh, bash, dash, busybox under bin/ or usr/bin/.
         val rootfsFile = File(rootfsPath)
         if (!rootfsFile.exists() || !rootfsFile.isDirectory) {
             lastError = "rootfs missing or not a directory at $rootfsPath — run SetupScreen first"
             Log.e(TAG, lastError)
             return false
         }
-        val binSh = File(rootfsPath, "bin/sh")
-        val binBash = File(rootfsPath, "bin/bash")
-        val shOk = binSh.exists()
-        val bashOk = binBash.exists()
-        Log.i(TAG, "rootfs/bin/sh exists=$shOk path=${binSh.absolutePath}")
-        Log.i(TAG, "rootfs/bin/bash exists=$bashOk path=${binBash.absolutePath}")
-        // Diagnostic listing if shell missing
-        if (!shOk && !bashOk) {
-            val listing = File(rootfsPath, "bin").listFiles()
-                ?.joinToString { f ->
-                    val suffix = if (f.isDirectory) "/" else if (f.exists()) "" else " (broken?)"
-                    f.name + suffix
-                } ?: "(bin/ missing or empty)"
-            lastError = "Rootfs extraction incomplete: /bin/sh not found under " +
-                "$rootfsPath/bin. Contents: $listing. " +
+        val shellCandidates = listOf(
+            "bin/sh", "bin/bash", "bin/dash", "bin/busybox",
+            "usr/bin/sh", "usr/bin/bash", "usr/bin/dash", "usr/bin/busybox",
+        )
+        val foundShell = shellCandidates.firstOrNull { rel ->
+            val f = File(rootfsPath, rel)
+            f.exists().also { exists ->
+                if (exists) Log.i(TAG, "shell candidate OK: $rel → ${f.absolutePath}")
+            }
+        }
+        // Log broken symlinks for diagnosis
+        for (rel in shellCandidates) {
+            val f = File(rootfsPath, rel)
+            if (!f.exists()) {
+                val link = java.nio.file.Paths.get(f.absolutePath)
+                try {
+                    if (java.nio.file.Files.isSymbolicLink(link)) {
+                        val tgt = java.nio.file.Files.readSymbolicLink(link)
+                        Log.w(TAG, "BROKEN symlink rootfs/$rel → $tgt")
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+        if (foundShell == null) {
+            val binListing = File(rootfsPath, "bin").listFiles()
+                ?.joinToString { f -> f.name + (if (f.isDirectory) "/" else "") }
+                ?: "(bin/ missing)"
+            val usrBinListing = File(rootfsPath, "usr/bin").listFiles()
+                ?.take(15)
+                ?.joinToString { f -> f.name }
+                ?: "(usr/bin/ missing)"
+            lastError = "Rootfs extraction incomplete: no shell found under " +
+                "$rootfsPath (bin/: $binListing; usr/bin/: $usrBinListing). " +
                 "Re-run SetupScreen to re-extract the rootfs."
             Log.e(TAG, lastError)
             return false
         }
-        Log.i(TAG, "rootfs OK: $rootfsPath (shell verified)")
+        Log.i(TAG, "rootfs OK: $rootfsPath (shell=$foundShell)")
 
         // ---- Resolve binaries (nativeLibraryDir → assets fallback) ----
         val prootPath = resolveBinary("libproot.so", nativeLibDir, filesDir)
@@ -209,12 +316,8 @@ class PtyBridge(private val context: Context) {
             ?: "$nativeLibDir/libbash.so"
         Log.i(TAG, "binaries: proot=$prootPath bash=$bashPath")
 
-        // Shell selection mirrors pty_bridge.c detect_shell():
-        // prefer /bin/bash if present in rootfs, else /bin/sh (never /bin/busybox)
-        val shellInGuest = when {
-            binBash.exists() -> "/bin/bash"
-            else -> "/bin/sh"
-        }
+        // Shell selection mirrors pty_bridge.c detect_shell() — any common shell
+        val shellInGuest = "/" + foundShell
         Log.i(TAG, "shell in guest: $shellInGuest")
 
         // ---- Explicit envp for execve — NEVER null ----

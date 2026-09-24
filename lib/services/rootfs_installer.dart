@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import '../utils/constants.dart';
 import 'archive_extractor.dart';
+import 'native_fs.dart';
 import 'proot_engine.dart';
 
 /// Install phases emitted to SetupScreen for progress UI.
@@ -135,15 +136,20 @@ class RootfsInstaller {
 
       if (_cancelled) throw const _CancelledException();
 
-      // ---------- Verify shell exists before marking installed ----------
-      // Absolute-path tar entries and broken symlink extraction used to leave
-      // rootfs without /bin/sh, causing:
-      //   proot error: '/bin/sh' not found (root=.../rootfs, cwd=/root, $PATH=(null))
+      // ---------- Repair UsrMerge links + ensure a shell exists ----------
+      // Standard Dart archive extractors drop OS-level symlinks and modes.
+      // Modern distros (Ubuntu/Debian UsrMerge, Alpine busybox) rely on:
+      //   /bin -> usr/bin, /lib -> usr/lib, /bin/sh -> dash|bash|busybox
+      _emit(InstallPhase.configuring,
+          'Repairing symlinks and permissions (UsrMerge)…',
+          progress: null);
+      await _repairUsrMergeAndShell(rootfsDir.path);
+
+      // ---------- Verify ANY shell exists before marking installed ----------
       final shellOk = await _verifyShell(rootfsDir.path);
       if (!shellOk) {
         _emit(InstallPhase.extracting,
-            'Extraction incomplete — /bin/sh missing. Retrying with Dart extractor…');
-        // Force Dart path (native tar may have failed silently on abs paths)
+            'Extraction incomplete — no shell found. Retrying with Dart extractor…');
         try {
           await rootfsDir.delete(recursive: true);
         } catch (_) {}
@@ -152,13 +158,16 @@ class RootfsInstaller {
           archivePath: archivePath,
           destDir: rootfsDir.path,
         );
+        if (retryOk) {
+          await _repairUsrMergeAndShell(rootfsDir.path);
+        }
         if (!retryOk || !await _verifyShell(rootfsDir.path)) {
           final detail = await _describeRootfs(rootfsDir.path);
           throw Exception(
-              'Rootfs extraction incomplete: /bin/sh not found under '
+              'Rootfs extraction incomplete: no shell found under '
               '$rootfsDir. $detail Re-run setup to re-download.');
         }
-        _emit(InstallPhase.extracting, 'Retry succeeded — /bin/sh present.');
+        _emit(InstallPhase.extracting, 'Retry succeeded — shell present.');
       }
 
       // ---------- Post-configure ----------
@@ -168,7 +177,7 @@ class RootfsInstaller {
       // Final gate — never mark installed without a shell
       if (!await _verifyShell(rootfsDir.path)) {
         throw Exception(
-            'Post-configure failed: /bin/sh still missing in $rootfsDir');
+            'Post-configure failed: no shell found in $rootfsDir');
       }
 
       // ---------- Cleanup ----------
@@ -180,14 +189,11 @@ class RootfsInstaller {
       // ---------- Mark installed ----------
       await PRootEngine.instance.setInstalled(true, distroId: distro.id);
 
-      final shPath = File('${rootfsDir.path}/bin/sh');
-      final bashPath = File('${rootfsDir.path}/bin/bash');
-      debugPrint('[RootfsInstaller] shell check: '
-          'bin/sh exists=${shPath.existsSync()} '
-          'bin/bash exists=${bashPath.existsSync()}');
+      final shellPath = await _findShell(rootfsDir.path);
+      debugPrint('[RootfsInstaller] shell check: found $shellPath');
 
       _emit(InstallPhase.done,
-          'Setup complete — /bin/sh verified. Launching terminal…',
+          'Setup complete — shell verified ($shellPath). Launching terminal…',
           progress: 1.0);
       return true;
     } on _CancelledException {
@@ -327,46 +333,186 @@ class RootfsInstaller {
   // Shell / rootfs verification
   // ---------------------------------------------------------------------------
 
-  /// Returns true if `<rootfs>/bin/sh` or `<rootfs>/bin/bash` exists
-  /// (follows symlinks — a dangling symlink does NOT count).
-  Future<bool> _verifyShell(String rootfs) async {
-    for (final rel in ['bin/sh', 'bin/bash', 'usr/bin/bash', 'bin/dash']) {
+  /// Relative paths that count as "a shell exists" across Ubuntu/Debian/Alpine
+  /// (including UsrMerge where /bin is a symlink to /usr/bin).
+  static const List<String> _shellCandidates = [
+    'bin/sh', 'bin/bash', 'bin/dash', 'bin/busybox',
+    'usr/bin/sh', 'usr/bin/bash', 'usr/bin/dash', 'usr/bin/busybox',
+    'bin/ash', 'usr/bin/ash',
+  ];
+
+  /// Returns the first relative shell path that exists (follows symlinks),
+  /// or null. A dangling symlink does NOT count.
+  Future<String?> _findShell(String rootfs) async {
+    for (final rel in _shellCandidates) {
       final f = File('$rootfs/$rel');
       try {
-        // File.exists() follows symlinks on dart:io — false for broken links.
         if (await f.exists()) {
           debugPrint('[RootfsInstaller] shell OK: $rel → ${f.absolute.path}');
-          return true;
+          return rel;
         }
         // Distinguish broken symlink from missing for logs
-        try {
-          final link = Link('$rootfs/$rel');
-          if (await link.exists()) {
-            final target = await link.target();
-            debugPrint(
-                '[RootfsInstaller] BROKEN symlink $rel → $target (target missing)');
-          }
-        } catch (_) {}
+        final link = Link('$rootfs/$rel');
+        if (await link.exists()) {
+          final target = await link.target();
+          debugPrint(
+              '[RootfsInstaller] BROKEN symlink $rel → $target (target missing)');
+        }
       } catch (e) {
         debugPrint('[RootfsInstaller] shell check error for $rel: $e');
       }
     }
-    return false;
+    return null;
+  }
+
+  /// Returns true if ANY common shell exists under [rootfs].
+  Future<bool> _verifyShell(String rootfs) async {
+    return await _findShell(rootfs) != null;
   }
 
   /// Best-effort listing for error messages.
   Future<String> _describeRootfs(String rootfs) async {
     try {
-      final bin = Directory('$rootfs/bin');
-      if (!await bin.exists()) return 'No $rootfs/bin directory.';
-      final names = await bin
-          .list()
-          .map((e) => e.uri.pathSegments.last)
-          .take(20)
-          .toList();
-      return 'bin/ contains: ${names.join(", ")}';
+      final parts = <String>[];
+      for (final dirName in ['bin', 'usr/bin', 'sbin', 'usr/sbin']) {
+        final dir = Directory('$rootfs/$dirName');
+        if (!await dir.exists()) {
+          parts.add('No $dirName/');
+          continue;
+        }
+        final names = await dir
+            .list()
+            .map((e) => e.uri.pathSegments.last)
+            .take(12)
+            .toList();
+        parts.add('$dirName/: ${names.join(", ")}');
+      }
+      return parts.join(' | ');
     } catch (e) {
-      return 'Cannot list bin/: $e';
+      return 'Cannot list rootfs: $e';
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // UsrMerge / symlink / permission repair
+  // ---------------------------------------------------------------------------
+
+  /// Post-extraction repair for modern Linux layouts.
+  ///
+  /// 1. UsrMerge: create `/bin` → `usr/bin`, `/lib` → `usr/lib`, etc. when
+  ///    the merge target exists but the top-level path is missing/empty.
+  /// 2. Ensure `/bin/sh` exists by symlinking to dash/bash/busybox if needed.
+  /// 3. Apply `chmod -R 755` on bin/sbin trees via native chmod(2).
+  Future<void> _repairUsrMergeAndShell(String rootfs) async {
+    // ---- 1. UsrMerge top-level symlinks ----
+    const merges = <String, String>{
+      'bin': 'usr/bin',
+      'sbin': 'usr/sbin',
+      'lib': 'usr/lib',
+      'lib64': 'usr/lib64',
+      'lib32': 'usr/lib32',
+    };
+    for (final entry in merges.entries) {
+      final top = '$rootfs/${entry.key}';
+      final target = entry.value; // relative — resolves inside rootfs
+      final targetDir = Directory('$rootfs/$target');
+      final topPath = Directory(top);
+
+      final targetExists = await targetDir.exists();
+      if (!targetExists) {
+        debugPrint('[RootfsInstaller] UsrMerge skip: $target missing');
+        continue;
+      }
+
+      // If top is already a correct symlink, done.
+      if (await NativeFs.isSymlink(top)) {
+        final existing = await NativeFs.readlink(top);
+        if (existing == target || existing == '/$target') {
+          continue;
+        }
+        debugPrint(
+            '[RootfsInstaller] UsrMerge replace wrong link $top → $existing (want $target)');
+        try {
+          if (topPath.existsSync()) await topPath.delete(recursive: true);
+        } catch (_) {}
+      } else if (await topPath.exists()) {
+        // Real directory/file already there (non-UsrMerge distro like Alpine
+        // with real /bin) — leave it alone.
+        final isDir = await topPath.exists() && topPath.statSync().type == FileSystemEntityType.directory;
+        if (isDir) {
+          // If empty placeholder, replace with symlink; if populated, keep.
+          final entries = await topPath.list().length;
+          if (entries > 0) {
+            debugPrint(
+                '[RootfsInstaller] UsrMerge keep populated $entry.key/ ($entries entries)');
+            continue;
+          }
+        }
+        debugPrint('[RootfsInstaller] UsrMerge replace empty $top with → $target');
+        try {
+          await topPath.delete(recursive: true);
+        } catch (_) {}
+      }
+
+      final ok = await NativeFs.symlink(target, top);
+      debugPrint('[RootfsInstaller] UsrMerge $top → $target: ok=$ok');
+    }
+
+    // ---- 2. Ensure /bin/sh exists ----
+    final shPath = '$rootfs/bin/sh';
+    final shExists = await NativeFs.exists(shPath);
+    if (!shExists) {
+      // Prefer a relative target so the link keeps working after UsrMerge.
+      // Order: same dir as sh, then usr/bin (relative ../usr/bin/...).
+      const bareNames = ['dash', 'bash', 'busybox', 'ash'];
+      String? chosen;
+
+      for (final name in bareNames) {
+        if (await NativeFs.exists('$rootfs/bin/$name')) {
+          chosen = name; // bin/sh -> dash  (relative)
+          break;
+        }
+        if (await NativeFs.exists('$rootfs/usr/bin/$name')) {
+          chosen = '../usr/bin/$name'; // bin/sh -> ../usr/bin/dash
+          break;
+        }
+      }
+
+      if (chosen != null) {
+        // Remove dangling sh if present
+        try {
+          final link = Link(shPath);
+          if (await link.exists() || await NativeFs.isSymlink(shPath)) {
+            await link.delete();
+          }
+        } catch (_) {
+          try {
+            File(shPath).delete();
+          } catch (_) {}
+        }
+        final ok = await NativeFs.symlink(chosen, shPath);
+        debugPrint('[RootfsInstaller] created /bin/sh → $chosen: ok=$ok');
+      } else {
+        debugPrint('[RootfsInstaller] WARNING: no sh target found to link');
+      }
+    }
+
+    // ---- 3. chmod -R 755 on essential bin trees ----
+    // Resolve through UsrMerge symlinks so we chmod the real directories.
+    const chmodDirs = [
+      'bin', 'sbin', 'usr/bin', 'usr/sbin', 'usr/libexec',
+    ];
+    for (final d in chmodDirs) {
+      final path = '$rootfs/$d';
+      if (!await NativeFs.exists(path)) continue;
+      final n = await NativeFs.chmodTree(path, 0x1ED); // 0755 = 493 = 0x1ED
+      debugPrint('[RootfsInstaller] chmodTree $d 755 → $n entries');
+    }
+
+    // Ensure /tmp is 1777
+    final tmp = '$rootfs/tmp';
+    if (await NativeFs.exists(tmp)) {
+      await NativeFs.chmod(tmp, 0x3FF); // 01777 = 1023 = 0x3FF
     }
   }
 
@@ -393,10 +539,8 @@ class RootfsInstaller {
       await hosts.writeAsString('127.0.0.1 localhost\n::1 localhost\n');
     }
 
-    // Make /tmp writable
-    try {
-      await Process.run('chmod', ['1777', '$rootfs/tmp']);
-    } catch (_) {}
+    // Make /tmp writable via native chmod (01777)
+    await NativeFs.chmod('$rootfs/tmp', 0x3FF);
 
     // Create a marker so isInstalled() can detect success even without prefs
     await File('$rootfs/.codeit_installed').writeAsString(

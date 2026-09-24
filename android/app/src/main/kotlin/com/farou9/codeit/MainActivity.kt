@@ -170,6 +170,67 @@ class MainActivity : FlutterActivity() {
                         result.success(installed)
                     }
 
+                    // ---------- Native FS helpers (real symlink/chmod syscalls) ----------
+                    "nativeSymlink" -> {
+                        try {
+                            val target = call.argument<String>("target")!!
+                            val path = call.argument<String>("path")!!
+                            val ok = ptyBridge?.symlink(target, path) == true
+                            result.success(ok)
+                        } catch (e: Exception) {
+                            result.error("SYMLINK_FAILED", e.message, null)
+                        }
+                    }
+
+                    "nativeChmod" -> {
+                        try {
+                            val path = call.argument<String>("path")!!
+                            val mode = call.argument<Number>("mode")!!.toInt()
+                            val ok = ptyBridge?.chmod(path, mode) == true
+                            result.success(ok)
+                        } catch (e: Exception) {
+                            result.error("CHMOD_FAILED", e.message, null)
+                        }
+                    }
+
+                    "nativeChmodTree" -> {
+                        try {
+                            val path = call.argument<String>("path")!!
+                            val mode = call.argument<Number>("mode")!!.toInt()
+                            val n = ptyBridge?.chmodTree(path, mode) ?: -1
+                            result.success(n)
+                        } catch (e: Exception) {
+                            result.error("CHMOD_TREE_FAILED", e.message, null)
+                        }
+                    }
+
+                    "nativeReadlink" -> {
+                        try {
+                            val path = call.argument<String>("path")!!
+                            result.success(ptyBridge?.readlink(path))
+                        } catch (e: Exception) {
+                            result.error("READLINK_FAILED", e.message, null)
+                        }
+                    }
+
+                    "nativeIsSymlink" -> {
+                        try {
+                            val path = call.argument<String>("path")!!
+                            result.success(ptyBridge?.isSymlink(path) == true)
+                        } catch (e: Exception) {
+                            result.error("ISSYMLINK_FAILED", e.message, null)
+                        }
+                    }
+
+                    "nativeExists" -> {
+                        try {
+                            val path = call.argument<String>("path")!!
+                            result.success(ptyBridge?.exists(path) == true)
+                        } catch (e: Exception) {
+                            result.error("EXISTS_FAILED", e.message, null)
+                        }
+                    }
+
                     else -> result.notImplemented()
                 }
             }

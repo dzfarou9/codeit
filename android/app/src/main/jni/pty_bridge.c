@@ -44,6 +44,7 @@
 #include <sys/types.h>
 #include <stdarg.h>
 #include <limits.h>
+#include <dirent.h>
 
 #define LOG_TAG "PtyBridge-JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -91,19 +92,24 @@ static int file_exists(const char *path) {
 /**
  * Detect the best shell inside [rootfsDir].
  * Writes the guest path (e.g. "/bin/bash") into [out].
- * Returns 0 on success; -1 if NO shell exists (caller must abort —
- * defaulting to a missing /bin/sh produced:
- *   proot error: '/bin/sh' not found ...).
+ * Returns 0 on success; -1 if NO shell exists.
  *
- * Candidates: /bin/bash, /bin/sh only. We never probe /bin/busybox —
- * Alpine images often have a broken/missing busybox path which caused:
- *   proot error: execve("/bin/busybox"): No such file or directory
+ * Accepts ANY common shell across Ubuntu/Debian/Alpine (UsrMerge-aware):
+ *   /bin/sh, /bin/bash, /bin/dash, /bin/busybox,
+ *   /usr/bin/sh, /usr/bin/bash, /usr/bin/dash, /usr/bin/busybox
  *
  * NOTE: We intentionally do NOT check /usr/bin/env — proot execs the
  * shell path directly; env is provided via explicit envp[] on execve.
  */
 static int detect_shell(const char *rootfsDir, char *out, size_t outLen) {
-    const char *candidates[] = { "/bin/bash", "/bin/sh", NULL };
+    /* Prefer interactive shells first; busybox last (Alpine). */
+    const char *candidates[] = {
+        "/bin/bash",  "/usr/bin/bash",
+        "/bin/sh",    "/usr/bin/sh",
+        "/bin/dash",  "/usr/bin/dash",
+        "/bin/busybox", "/usr/bin/busybox",
+        NULL
+    };
     char hostPath[1024];
 
     for (int i = 0; candidates[i] != NULL; i++) {
@@ -119,9 +125,7 @@ static int detect_shell(const char *rootfsDir, char *out, size_t outLen) {
                  candidates[i], hostPath);
             return 0;
         }
-        /* Log dangling symlink for diagnosis */
         if (access(hostPath, F_OK) != 0 && errno == ENOENT) {
-            /* Try readlink to see if a broken symlink is present */
             char linkBuf[256];
             ssize_t n = readlink(hostPath, linkBuf, sizeof(linkBuf) - 1);
             if (n > 0) {
@@ -131,8 +135,9 @@ static int detect_shell(const char *rootfsDir, char *out, size_t outLen) {
         }
     }
 
-    set_error("No shell in rootfs: neither /bin/bash nor /bin/sh exists under %s "
-              "(extraction incomplete — re-run Setup)", rootfsDir);
+    set_error("No shell in rootfs under %s "
+              "(tried /bin/{sh,bash,dash,busybox} and /usr/bin/… — "
+              "extraction incomplete; re-run Setup)", rootfsDir);
     return -1;
 }
 
@@ -246,20 +251,29 @@ Java_com_farou9_codeit_PtyBridge_nativePtyStart(
     }
     LOGI("rootfs OK: %s", rootfsPath);
 
-    /* ---- Verify shell exists under rootfs BEFORE fork/proot ---- */
+    /* ---- Verify ANY shell exists under rootfs BEFORE fork/proot ---- */
     {
-        char shHost[1024];
-        snprintf(shHost, sizeof(shHost), "%s/bin/sh", rootfsPath);
-        char bashHost[1024];
-        snprintf(bashHost, sizeof(bashHost), "%s/bin/bash", rootfsPath);
-        int shExists = file_exists(shHost);
-        int bashExists = file_exists(bashHost);
-        LOGI("shell preflight: %s exists=%d  %s exists=%d",
-             shHost, shExists, bashHost, bashExists);
-        if (!shExists && !bashExists) {
-            set_error("Rootfs extraction incomplete: /bin/sh not found at %s "
-                      "(and no /bin/bash) — re-run SetupScreen to re-extract",
-                      shHost);
+        static const char *shellRels[] = {
+            "/bin/sh", "/bin/bash", "/bin/dash", "/bin/busybox",
+            "/usr/bin/sh", "/usr/bin/bash", "/usr/bin/dash", "/usr/bin/busybox",
+            NULL
+        };
+        int anyShell = 0;
+        for (int i = 0; shellRels[i] != NULL; i++) {
+            char host[1024];
+            snprintf(host, sizeof(host), "%s%s", rootfsPath, shellRels[i]);
+            int ex = file_exists(host);
+            if (ex) {
+                LOGI("shell preflight: %s exists=%d", shellRels[i], ex);
+                anyShell = 1;
+                break;
+            }
+        }
+        if (!anyShell) {
+            set_error("Rootfs extraction incomplete: no shell under %s "
+                      "(tried bin/ and usr/bin/ sh|bash|dash|busybox) — "
+                      "re-run SetupScreen to re-extract",
+                      rootfsPath);
             goto fail;
         }
     }
@@ -579,4 +593,138 @@ Java_com_farou9_codeit_PtyBridge_nativePtyKill(JNIEnv *env, jobject thiz) {
 JNIEXPORT jint JNICALL
 Java_com_farou9_codeit_PtyBridge_nativePtyGetFd(JNIEnv *env, jobject thiz) {
     return g_masterFd;
+}
+
+/* ==========================================================================
+ * Native filesystem helpers for rootfs extraction (NDK real syscalls).
+ *
+ * Dart's archive package cannot create POSIX symlinks reliably on Android
+ * and Process.run('chmod') often fails (no chmod binary / W^X). These JNI
+ * entry points call the real symlink()/chmod()/readlink() syscalls so
+ * UsrMerge layouts (/bin -> /usr/bin) and executable bits survive extraction
+ * for Ubuntu, Debian, and Alpine.
+ * ========================================================================== */
+
+/** Create a POSIX symlink at [jPath] pointing to [jTarget].
+ *  Returns 0 on success, -errno on failure. */
+JNIEXPORT jint JNICALL
+Java_com_farou9_codeit_PtyBridge_nativeSymlink(JNIEnv *env, jobject thiz,
+                                              jstring jTarget, jstring jPath) {
+    if (jTarget == NULL || jPath == NULL) return -EINVAL;
+    const char *target = (*env)->GetStringUTFChars(env, jTarget, NULL);
+    const char *path   = (*env)->GetStringUTFChars(env, jPath, NULL);
+    int rc = symlink(target, path);
+    int err = (rc == 0) ? 0 : -errno;
+    if (rc != 0) {
+        LOGW("symlink(%s -> %s) failed: %s", target, path, strerror(errno));
+    } else {
+        LOGD("symlink OK: %s -> %s", path, target);
+    }
+    (*env)->ReleaseStringUTFChars(env, jTarget, target);
+    (*env)->ReleaseStringUTFChars(env, jPath, path);
+    return err;
+}
+
+/** chmod([jPath], [mode]) — mode is POSIX (e.g. 0755 = 493).
+ *  Returns 0 on success, -errno on failure. */
+JNIEXPORT jint JNICALL
+Java_com_farou9_codeit_PtyBridge_nativeChmod(JNIEnv *env, jobject thiz,
+                                            jstring jPath, jint mode) {
+    if (jPath == NULL) return -EINVAL;
+    const char *path = (*env)->GetStringUTFChars(env, jPath, NULL);
+    int rc = chmod(path, (mode_t) mode);
+    int err = (rc == 0) ? 0 : -errno;
+    if (rc != 0) {
+        LOGW("chmod(%s, %o) failed: %s", path, (unsigned) mode, strerror(errno));
+    }
+    (*env)->ReleaseStringUTFChars(env, jPath, path);
+    return err;
+}
+
+/** readlink([jPath]) → target string, or null on failure. */
+JNIEXPORT jstring JNICALL
+Java_com_farou9_codeit_PtyBridge_nativeReadlink(JNIEnv *env, jobject thiz,
+                                               jstring jPath) {
+    if (jPath == NULL) return NULL;
+    const char *path = (*env)->GetStringUTFChars(env, jPath, NULL);
+    char buf[4096];
+    ssize_t n = readlink(path, buf, sizeof(buf) - 1);
+    (*env)->ReleaseStringUTFChars(env, jPath, path);
+    if (n < 0) return NULL;
+    buf[n] = '\0';
+    return (*env)->NewStringUTF(env, buf);
+}
+
+/** True if [jPath] is a symbolic link (lstat S_ISLNK). */
+JNIEXPORT jboolean JNICALL
+Java_com_farou9_codeit_PtyBridge_nativeIsSymlink(JNIEnv *env, jobject thiz,
+                                                jstring jPath) {
+    if (jPath == NULL) return JNI_FALSE;
+    const char *path = (*env)->GetStringUTFChars(env, jPath, NULL);
+    struct stat st;
+    int rc = lstat(path, &st);
+    (*env)->ReleaseStringUTFChars(env, jPath, path);
+    return (rc == 0 && S_ISLNK(st.st_mode)) ? JNI_TRUE : JNI_FALSE;
+}
+
+/** True if path exists (follows symlinks — dangling link = false). */
+JNIEXPORT jboolean JNICALL
+Java_com_farou9_codeit_PtyBridge_nativeExists(JNIEnv *env, jobject thiz,
+                                             jstring jPath) {
+    if (jPath == NULL) return JNI_FALSE;
+    const char *path = (*env)->GetStringUTFChars(env, jPath, NULL);
+    int ok = (access(path, F_OK) == 0);
+    (*env)->ReleaseStringUTFChars(env, jPath, path);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+/** Recursively chmod a directory tree.
+ *  mode is POSIX (e.g. 0755). Does NOT recurse into symlinked subtrees
+ *  (avoids UsrMerge /bin -> /usr/bin double-walk).
+ *  Returns number of entries updated, or -1 on root failure. */
+static int chmod_tree_c(const char *root, mode_t mode) {
+    struct stat st;
+    if (lstat(root, &st) != 0) return -1;
+    if (S_ISLNK(st.st_mode)) return 0;  /* skip symlink roots */
+
+    int updated = 0;
+    if (chmod(root, mode) == 0) updated++;
+
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(root);
+        if (d != NULL) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+                    continue;
+                char child[4096];
+                int n = snprintf(child, sizeof(child), "%s/%s", root, ent->d_name);
+                if (n <= 0 || n >= (int) sizeof(child)) continue;
+                struct stat cst;
+                if (lstat(child, &cst) != 0) continue;
+                if (S_ISLNK(cst.st_mode)) continue;
+                if (S_ISDIR(cst.st_mode)) {
+                    int sub = chmod_tree_c(child, mode);
+                    if (sub > 0) updated += sub;
+                } else {
+                    if (chmod(child, mode) == 0) updated++;
+                }
+            }
+            closedir(d);
+        }
+    }
+    return updated;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_farou9_codeit_PtyBridge_nativeChmodTree(JNIEnv *env, jobject thiz,
+                                                jstring jPath, jint mode) {
+    if (jPath == NULL) return -1;
+    const char *root = (*env)->GetStringUTFChars(env, jPath, NULL);
+    int updated = chmod_tree_c(root, (mode_t) mode);
+    if (updated < 0) {
+        LOGW("chmodTree: failed for %s: %s", root, strerror(errno));
+    }
+    (*env)->ReleaseStringUTFChars(env, jPath, root);
+    return updated;
 }
