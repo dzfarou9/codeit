@@ -4,6 +4,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import '../utils/constants.dart';
+import 'archive_extractor.dart';
 import 'proot_engine.dart';
 
 /// Install phases emitted to SetupScreen for progress UI.
@@ -198,194 +199,88 @@ class RootfsInstaller {
   }
 
   // ---------------------------------------------------------------------------
-  // Extraction — prefers native libtar.so, falls back to Dart archive
+  // Extraction — dynamic compression detection + native tar / Dart fallback
   // ---------------------------------------------------------------------------
+
+  /// Detect compression format from file extension and return tar flags.
+  /// GNU tar requires explicit -z / -J / -j; bsdtar auto-detects but the
+  /// explicit flags are safe for both.
+  static List<String> _tarExtractFlags(String archivePath) {
+    final lower = archivePath.toLowerCase();
+    if (lower.endsWith('.tar.gz') || lower.endsWith('.tgz')) {
+      return ['-xzpf'];  // gzip
+    } else if (lower.endsWith('.tar.xz') || lower.endsWith('.txz')) {
+      return ['-xJpf'];  // xz
+    } else if (lower.endsWith('.tar.bz2') || lower.endsWith('.tbz2')) {
+      return ['-xjpf'];  // bzip2
+    } else if (lower.endsWith('.tar')) {
+      return ['-xpf'];   // plain tar
+    }
+    // Unknown — let tar auto-detect (bsdtar) or fail loudly
+    return ['-xpf'];
+  }
 
   Future<bool> _extract({
     required String archivePath,
     required String destDir,
     required ArchiveType archiveType,
   }) async {
-    // Try native tar first (preserves symlinks / modes correctly)
+    debugPrint('[RootfsInstaller] extracting $archivePath → $destDir '
+        '(type=$archiveType, flags=${_tarExtractFlags(archivePath)})');
+
+    // 1) Try native tar (preserves symlinks / modes correctly)
     final tarOk = await _extractViaNativeTar(archivePath, destDir);
     if (tarOk) return true;
 
-    debugPrint('[RootfsInstaller] Native tar unavailable, using Dart archive fallback');
-    return _extractViaDartArchive(archivePath, destDir, archiveType);
+    // 2) Fall back to pure-Dart ArchiveExtractor
+    debugPrint('[RootfsInstaller] native tar failed, using Dart ArchiveExtractor');
+    try {
+      return await ArchiveExtractor.extract(
+        archivePath: archivePath,
+        destDir: destDir,
+      );
+    } catch (e, st) {
+      debugPrint('[RootfsInstaller] ArchiveExtractor threw: $e\n$st');
+      return false;
+    }
   }
 
   Future<bool> _extractViaNativeTar(String archive, String dest) async {
     try {
       final tarBin = PRootEngine.instance.tarPath;
       final tarFile = File(tarBin);
-      // tarBin lives in nativeLibraryDir — check existence via Dart File
-      // On some devices nativeLibraryDir != filesDir, but File still works
-      // because it is a real path. If not found, fall back.
       if (!await tarFile.exists()) {
         debugPrint('[RootfsInstaller] libtar.so not found at $tarBin — skipping native extract');
         return false;
       }
 
-      // bsdtar / GNU tar flags:
-      //  -xpf : extract, preserve permissions, file is archive
-      //  -C dest
-      // For .tar.xz / .tar.gz bsdtar auto-detects compression.
-      final result = await Process.run(tarBin, [
-        '-xpf',
-        archive,
-        '-C',
-        dest,
-      ]);
+      // Pick flags based on compression: -z (gz), -J (xz), -j (bz2)
+      final flags = _tarExtractFlags(archive);
+      debugPrint('[RootfsInstaller] running: $tarBin $flags $archive -C $dest');
+
+      final result = await Process.run(tarBin, [...flags, archive, '-C', dest]);
 
       if (result.exitCode == 0) {
-        debugPrint('[RootfsInstaller] Native tar succeeded');
+        debugPrint('[RootfsInstaller] native tar succeeded');
         return true;
       }
 
-      debugPrint('[RootfsInstaller] Native tar exit ${result.exitCode}: ${result.stderr}');
-      return false;
-    } catch (e) {
-      debugPrint('[RootfsInstaller] Native tar exception: $e');
-      return false;
-    }
-  }
-
-  Future<bool> _extractViaDartArchive(
-      String archive, String dest, ArchiveType type) async {
-    // Implemented with package:archive — handles tar.gz / tar.xz / zip
-    // For .tar.xz we need to decompress xz first; archive package supports this.
-    try {
-      // Lazy import to avoid hard dependency if not needed
-      // ignore: avoid_dynamic_calls
-      final bytes = await File(archive).readAsBytes();
-
-      // Use a simple heuristic: try TarDecoder on decompressed bytes
-      // We delegate to a helper that handles each ArchiveType
-      final archiveData = await _decodeArchive(bytes, type);
-      if (archiveData == null) return false;
-
-      for (final file in archiveData) {
-        final outPath = '$dest/${file.name}';
-        if (file.isFile) {
-          final outFile = File(outPath);
-          await outFile.parent.create(recursive: true);
-          await outFile.writeAsBytes(file.content as List<int>);
-          // Restore executable bit where applicable (best effort)
-          if (file.mode != null && (file.mode! & 0x49) != 0) {
-            try {
-              await Process.run('chmod', ['+x', outPath]);
-            } catch (_) {}
-          }
-          // Handle symlinks — archive package exposes isSymbolicLink
-          if (file.isSymbolicLink) {
-            try {
-              final link = Link(outPath);
-              if (await link.exists()) await link.delete();
-              // file.content for symlink is link target string
-              final target = String.fromCharCodes(file.content as List<int>);
-              await Link(outPath).create(target);
-            } catch (e) {
-              debugPrint('[RootfsInstaller] symlink create failed $outPath: $e');
-            }
-          }
-        } else {
-          await Directory(outPath).create(recursive: true);
-        }
+      // Retry with auto-detect (bsdtar style, no compression flag)
+      debugPrint('[RootfsInstaller] native tar exit ${result.exitCode}: '
+          '${result.stderr} — retrying with auto-detect');
+      final retry = await Process.run(tarBin, ['-xpf', archive, '-C', dest]);
+      if (retry.exitCode == 0) {
+        debugPrint('[RootfsInstaller] native tar auto-detect succeeded');
+        return true;
       }
-      return true;
+
+      debugPrint('[RootfsInstaller] native tar retry failed '
+          'exit=${retry.exitCode}: ${retry.stderr}');
+      return false;
     } catch (e, st) {
-      debugPrint('[RootfsInstaller] Dart archive extract failed: $e\n$st');
+      debugPrint('[RootfsInstaller] native tar exception: $e\n$st');
       return false;
     }
-  }
-
-  Future<List<dynamic>?> _decodeArchive(Uint8List bytes, ArchiveType type) async {
-    // Dynamic to avoid static import issues if archive package version differs
-    try {
-      // Import at runtime via the archive package API
-      // We use conditional logic based on ArchiveType
-      switch (type) {
-        case ArchiveType.tarXz:
-          // XZ decompression + tar
-          return await _decodeTarXz(bytes);
-        case ArchiveType.tarGz:
-          return await _decodeTarGz(bytes);
-        case ArchiveType.tarBz2:
-          return await _decodeTarBz2(bytes);
-        case ArchiveType.zip:
-          return await _decodeZip(bytes);
-      }
-    } catch (e) {
-      debugPrint('[RootfsInstaller] _decodeArchive error: $e');
-      return null;
-    }
-  }
-
-  Future<List<dynamic>?> _decodeTarGz(Uint8List bytes) async {
-    try {
-      // ignore: avoid_dynamic_calls
-      final archive = await _runArchiveDecode(bytes, 'tarGz');
-      return archive;
-    } catch (e) {
-      debugPrint('[RootfsInstaller] tarGz decode: $e');
-      return null;
-    }
-  }
-
-  Future<List<dynamic>?> _decodeTarXz(Uint8List bytes) async {
-    try {
-      final archive = await _runArchiveDecode(bytes, 'tarXz');
-      return archive;
-    } catch (e) {
-      debugPrint('[RootfsInstaller] tarXz decode: $e');
-      return null;
-    }
-  }
-
-  Future<List<dynamic>?> _decodeTarBz2(Uint8List bytes) async {
-    try {
-      final archive = await _runArchiveDecode(bytes, 'tarBz2');
-      return archive;
-    } catch (e) {
-      debugPrint('[RootfsInstaller] tarBz2 decode: $e');
-      return null;
-    }
-  }
-
-  Future<List<dynamic>?> _decodeZip(Uint8List bytes) async {
-    try {
-      final archive = await _runArchiveDecode(bytes, 'zip');
-      return archive;
-    } catch (e) {
-      debugPrint('[RootfsInstaller] zip decode: $e');
-      return null;
-    }
-  }
-
-  // Helper that uses package:archive decoders via dart:io process isolation
-  // to avoid loading the entire archive in the UI isolate for large rootfs.
-  Future<List<dynamic>?> _runArchiveDecode(Uint8List bytes, String kind) async {
-    // Run in a microtask; for very large archives consider compute()
-    // but archive objects are not easily transferable.
-    // For now decode on current isolate with streaming where possible.
-    // We attempt a direct decode using the archive package if available.
-    try {
-      // Try to use package:archive if it is in pubspec
-      // This is a best-effort dynamic path; if package is absent, throw.
-      return await _tryArchivePackage(bytes, kind);
-    } catch (e) {
-      debugPrint('[RootfsInstaller] _runArchiveDecode $kind failed: $e');
-      return null;
-    }
-  }
-
-  Future<List<dynamic>?> _tryArchivePackage(Uint8List bytes, String kind) async {
-    // This will be resolved at compile time if `archive` is in pubspec.
-    // We import it statically in a helper file to avoid dynamic issues.
-    // For now, throw to trigger native tar path as primary.
-    // The Dart fallback is implemented in archive_extractor.dart
-    throw UnimplementedError(
-        'Dart archive fallback requires archive_extractor.dart — native tar is preferred');
   }
 
   // ---------------------------------------------------------------------------
