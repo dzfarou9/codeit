@@ -14,33 +14,25 @@ class AppConstants {
   static const String keyInstalledDistro = 'installed_distro';
   static const String keyRootfsVersion = 'rootfs_version';
 
-  // Termux / proot-distro mirror configuration
-  // Primary: ghcr.io / github releases for proot-distro rootfs
-  // Fallback: Termux package mirrors for bootstrap archives
+  // Official direct CDN links for arm64-v8a rootfs archives.
+  // Each distro lists mirrors in priority order; RootfsInstaller tries them
+  // sequentially. All served over HTTPS with redirects enabled in Dio.
   static const List<RootfsDistro> availableDistros = [
     RootfsDistro(
       id: 'ubuntu',
       displayName: 'Ubuntu 22.04 (Jammy)',
-      // Official proot-distro Ubuntu rootfs — aarch64 minimal
-      // Source: https://github.com/termux/proot-distro
-      // These are resolved at install time; URLs are templated because
-      // release tags move. RootfsInstaller tries each mirror in order.
       mirrors: [
-        // GitHub releases via proot-distro (most reliable)
-        'https://github.com/termux/proot-distro/releases/download/v4.18.0/ubuntu-aarch64-pd-v4.18.0.tar.xz',
-        // Termux bootstrap fallback (if proot-distro unavailable, use bootstrap as base)
-        'https://packages.termux.dev/bootstrap/aarch64/bootstrap-aarch64.zip',
+        'https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04-base-arm64.tar.gz',
       ],
-      archiveType: ArchiveType.tarXz,
+      archiveType: ArchiveType.tarGz,
       defaultShell: '/bin/bash',
       estimatedSizeMb: 145,
     ),
     RootfsDistro(
       id: 'alpine',
-      displayName: 'Alpine 3.19 (Minimal)',
+      displayName: 'Alpine 3.20 (Minimal)',
       mirrors: [
-        'https://github.com/termux/proot-distro/releases/download/v4.18.0/alpine-aarch64-pd-v4.18.0.tar.xz',
-        'https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/aarch64/alpine-minirootfs-3.19.1-aarch64.tar.gz',
+        'https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/alpine-minirootfs-3.20.3-aarch64.tar.gz',
       ],
       archiveType: ArchiveType.tarGz,
       defaultShell: '/bin/sh',
@@ -50,7 +42,7 @@ class AppConstants {
       id: 'debian',
       displayName: 'Debian 12 (Bookworm)',
       mirrors: [
-        'https://github.com/termux/proot-distro/releases/download/v4.18.0/debian-aarch64-pd-v4.18.0.tar.xz',
+        'https://deb.debian.org/debian-images/debian-12-generic-arm64.tar.xz',
       ],
       archiveType: ArchiveType.tarXz,
       defaultShell: '/bin/bash',

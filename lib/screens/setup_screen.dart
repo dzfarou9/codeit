@@ -199,7 +199,7 @@ class _SetupScreenState extends State<SetupScreen> {
                       }),
                       const SizedBox(height: 8),
                       const Text(
-                        'Rootfs is downloaded from Termux proot-distro mirrors into app private storage (Scoped Storage). No Termux app required.',
+                        'Rootfs is downloaded from official distro CDNs into app private storage (Scoped Storage). No Termux app required.',
                         style: TextStyle(fontSize: 11, color: Colors.white30, height: 1.4),
                       ),
                     ],

@@ -34,7 +34,7 @@ class InstallProgress {
 
 /// RootfsInstaller — downloads and extracts a Linux rootfs into filesDir/rootfs.
 ///
-/// Download sources: Termux proot-distro GitHub releases / Termux mirrors.
+/// Download sources: official distro CDNs (Ubuntu cdimage, Alpine CDN, Debian CDN).
 /// Extraction: uses native libtar.so (bsdtar) via nativeLibraryDir if available,
 /// otherwise falls back to Dart `archive` package. POSIX modes and symlinks are
 /// preserved via the native tar path when possible.
